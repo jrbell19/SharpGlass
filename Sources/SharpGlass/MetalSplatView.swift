@@ -38,6 +38,13 @@ struct MetalSplatView: NSViewRepresentable {
         renderer.exposure = Float(viewModel.exposure)
         renderer.gamma = Float(viewModel.gamma)
         renderer.vignetteStrength = Float(viewModel.vignetteStrength)
+        renderer.splatScale = Float(viewModel.splatScale)
+        renderer.saturation = Float(viewModel.saturation)
+        renderer.colorMode = viewModel.colorMode == .standard ? 0 : 1
+        
+        renderer.cameraPosition = viewModel.camera
+        renderer.orbitTarget = viewModel.orbitTarget
+        renderer.isNavigating = viewModel.isNavigating
     }
     
     func makeCoordinator() -> Coordinator {

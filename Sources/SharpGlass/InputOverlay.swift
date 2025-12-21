@@ -11,13 +11,16 @@ struct InputOverlay: NSViewRepresentable {
         }
         
         @objc func scrollWheel(_ event: NSEvent) {
-            parent.onScroll(Double(event.deltaY))
+            // Note: This coordinator method isn't used - InputView handles scroll directly
+            parent.onScroll(Double(event.deltaY), CGPoint(x: 0.5, y: 0.5), event.modifierFlags)
         }
     }
     
     // Callbacks
-    var onDrag: (_ delta: CGSize) -> Void
-    var onScroll: (_ delta: CGFloat) -> Void
+    var onMouseDown: () -> Void
+    var onMouseUp: () -> Void
+    var onDrag: (_ delta: CGSize, _ button: Int, _ modifiers: NSEvent.ModifierFlags) -> Void
+    var onScroll: (_ delta: CGFloat, _ position: CGPoint, _ modifiers: NSEvent.ModifierFlags) -> Void
     var onKeyDown: (_ code: UInt16) -> Void
     var onKeyUp: (_ code: UInt16) -> Void
     
@@ -27,6 +30,8 @@ struct InputOverlay: NSViewRepresentable {
     
     func makeNSView(context: Context) -> InputView {
         let view = InputView()
+        view.onMouseDown = onMouseDown
+        view.onMouseUp = onMouseUp
         view.onDrag = onDrag
         view.onScroll = onScroll
         view.onKeyDown = onKeyDown
@@ -35,6 +40,8 @@ struct InputOverlay: NSViewRepresentable {
     }
     
     func updateNSView(_ nsView: InputView, context: Context) {
+        nsView.onMouseDown = onMouseDown
+        nsView.onMouseUp = onMouseUp
         nsView.onDrag = onDrag
         nsView.onScroll = onScroll
         nsView.onKeyDown = onKeyDown
@@ -42,34 +49,75 @@ struct InputOverlay: NSViewRepresentable {
     }
     
     class InputView: NSView {
-        var onDrag: ((CGSize) -> Void)?
-        var onScroll: ((CGFloat) -> Void)?
+        var onMouseDown: (() -> Void)?
+        var onMouseUp: (() -> Void)?
+        var onDrag: ((CGSize, Int, NSEvent.ModifierFlags) -> Void)?
+        var onScroll: ((CGFloat, CGPoint, NSEvent.ModifierFlags) -> Void)?
         var onKeyDown: ((UInt16) -> Void)?
         var onKeyUp: ((UInt16) -> Void)?
         
-        override var acceptsFirstResponder: Bool { true }
+        // Track whether the current drag started in our view
+        private var isDraggingInView = false
         
-        // 0: Left, 1: Right, 2: Middle/Other
+        override var acceptsFirstResponder: Bool { true }
+        override var canBecomeKeyView: Bool { true }
         
         override func mouseDown(with event: NSEvent) {
-            // Focus on click
-            window?.makeFirstResponder(self)
+            self.window?.makeFirstResponder(self)
+            isDraggingInView = true
+            onMouseDown?()
         }
         
         override func mouseDragged(with event: NSEvent) {
-            onDrag?(CGSize(width: event.deltaX, height: event.deltaY))
+            // Only process drag if it started in our view (not title bar)
+            guard isDraggingInView else { return }
+            onDrag?(CGSize(width: event.deltaX, height: event.deltaY), 0, event.modifierFlags)
+        }
+        
+        override func mouseUp(with event: NSEvent) {
+            isDraggingInView = false
+            onMouseUp?()
+        }
+        
+        override func rightMouseDown(with event: NSEvent) {
+            self.window?.makeFirstResponder(self)
+            isDraggingInView = true
+            onMouseDown?()
         }
         
         override func rightMouseDragged(with event: NSEvent) {
-            onDrag?(CGSize(width: event.deltaX, height: event.deltaY))
+            // Only process drag if it started in our view
+            guard isDraggingInView else { return }
+            onDrag?(CGSize(width: event.deltaX, height: event.deltaY), 1, event.modifierFlags)
+        }
+        
+        override func rightMouseUp(with event: NSEvent) {
+            isDraggingInView = false
+            onMouseUp?()
+        }
+        
+        override func otherMouseDown(with event: NSEvent) {
+            self.window?.makeFirstResponder(self)
+            isDraggingInView = true
+            onMouseDown?()
         }
         
         override func otherMouseDragged(with event: NSEvent) {
-            onDrag?(CGSize(width: event.deltaX, height: event.deltaY))
+            // Only process drag if it started in our view
+            guard isDraggingInView else { return }
+            onDrag?(CGSize(width: event.deltaX, height: event.deltaY), event.buttonNumber, event.modifierFlags)
+        }
+        
+        override func otherMouseUp(with event: NSEvent) {
+            isDraggingInView = false
+            onMouseUp?()
         }
         
         override func scrollWheel(with event: NSEvent) {
-            onScroll?(event.deltaY)
+            let position = convert(event.locationInWindow, from: nil)
+            // Normalize position to 0-1 range
+            let normalizedPos = CGPoint(x: position.x / bounds.width, y: position.y / bounds.height)
+            onScroll?(event.deltaY, normalizedPos, event.modifierFlags)
         }
         
         override func keyDown(with event: NSEvent) {

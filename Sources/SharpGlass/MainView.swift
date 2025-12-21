@@ -1,6 +1,7 @@
 import SwiftUI
 
-struct MainView: View {
+public struct MainView: View {
+    public init() {}
     @StateObject private var viewModel = SharpViewModel()
     @State private var isDragging = false
     
@@ -9,23 +10,20 @@ struct MainView: View {
     @State private var basePitch: Double = 0
     @State private var baseZoom: Double = 0
     
-    var body: some View {
+    public var body: some View {
         ZStack {
-            // Root Background to prevent white bars
-            Color.black.ignoresSafeArea()
-            
-
-            
-            // Cinematic Background (Nebula)
-            LiquidBackground()
-            
-            // Immersive Content Layer
-            ZStack(alignment: .trailing) {
-                // Main Viewer (Full Bleed)
-                ZStack {
-                    if let gaussians = viewModel.gaussians {
+            // ---------------------------------------------------------
+            // 1. CONTENT LAYER
+            // ---------------------------------------------------------
+            ZStack {
+                // Backgrounds
+                Color.black.ignoresSafeArea()
+                LiquidBackground()
+                
+                Group {
+                    if let _ = viewModel.gaussians {
+                        // 3D Viewport
                         TimelineView(.animation) { timeline in
-                            // 2. 3D Viewport
                             ZStack {
                                 MetalSplatView(
                                     gaussians: viewModel.gaussians,
@@ -33,85 +31,225 @@ struct MainView: View {
                                     viewModel: viewModel
                                 )
                                 .edgesIgnoringSafeArea(.all)
+                                
+                                // View Cube (Top Right)
+                                VStack {
+                                    HStack {
+                                        Spacer()
+                                        ViewCube(rotation: viewModel.camera.viewMatrix()) { theta, phi, dist in
+                                            viewModel.snapCamera(theta: theta, phi: phi, distance: dist)
+                                        }
+                                        .padding(.trailing, 24)
+                                        .padding(.top, 60)
+                                    }
+                                    Spacer()
+                                }
                             }
-                            .onChange(of: timeline.date) { newDate in
+                            .onChange(of: timeline.date) { _, newDate in
                                 viewModel.updateCamera(time: newDate.timeIntervalSinceReferenceDate)
                             }
                         }
-
-                        // Input Overlay on top to capture all mouse/keyboard events
                         .overlay(
                             InputOverlay(
-                                onDrag: viewModel.handleDrag,
-                                onScroll: viewModel.handleScroll,
+                                onMouseDown: { viewModel.isNavigating = true },
+                                onMouseUp: { viewModel.isNavigating = false },
+                                onDrag: { delta, button, mods in
+                                    viewModel.handleDrag(delta: delta, button: button, modifiers: mods)
+                                },
+                                onScroll: { delta, position, mods in
+                                    viewModel.handleScroll(delta: delta, position: position, modifiers: mods)
+                                },
                                 onKeyDown: viewModel.handleKeyDown,
                                 onKeyUp: viewModel.handleKeyUp
                             )
                         )
                     } else if let original = viewModel.selectedImage {
-                        Image(nsImage: original)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .opacity(viewModel.isProcessing ? 0.05 : 0.4)
-                            .padding(100)
-                            .blur(radius: viewModel.isProcessing ? 20 : 0)
-                            .saturation(0.5)
+                        // Full Bleed Image - Constrained to Window Size
+                        // GeometryReader ensures we fill the window but NEVER exceed it.
+                        GeometryReader { proxy in
+                            Image(nsImage: original)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: proxy.size.width, height: proxy.size.height)
+                                .clipped()
+                        }
                     } else {
-                        VStack(spacing: 24) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 24, weight: .ultraLight))
-                                .foregroundStyle(.white.opacity(0.1))
-                            Text("DRAG AND DROP")
-                                .font(.system(size: 11, weight: .bold, design: .rounded))
-                                .kerning(3)
-                                .foregroundStyle(.white.opacity(0.2))
+                        // Empty State
+                        VStack(spacing: 16) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.system(size: 40, weight: .ultraLight))
+                                .foregroundStyle(.white.opacity(0.15))
+                            Text("Drop an image to begin")
+                                .font(.system(size: 13, weight: .regular))
+                                .foregroundStyle(.white.opacity(0.3))
                         }
                     }
-                    
-                    if isDragging {
-                        Rectangle()
-                            .fill(.ultraThinMaterial)
-                            .background(Color.black.opacity(0.3))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 16)
-                                    .strokeBorder(Color.white.opacity(0.15), style: StrokeStyle(lineWidth: 1, dash: [4]))
-                                    .padding(60)
-                            )
-                            .overlay(
-                                Text("RELEASE TO SYNTHESIZE")
-                                    .font(.system(size: 12, weight: .bold))
-                                    .kerning(2)
-                                    .foregroundStyle(.white.opacity(0.6))
-                            )
-                            .transition(.opacity.animation(.easeInOut))
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .contentShape(Rectangle())
-                .onDrop(of: ["public.file-url"], isTargeted: $isDragging) { providers in
-                    guard let item = providers.first else { return false }
-                    
-                    // Modern URL loading
-                    _ = item.loadObject(ofClass: URL.self) { url, error in
-                        if let url = url {
-                            DispatchQueue.main.async {
-                                viewModel.importFile(url: url)
-                            }
-                        } else if let error = error {
-                            print("Drop Error: \(error.localizedDescription)")
-                        }
-                    }
-                    return true
                 }
                 
-                // Balanced Professional Sidebar
-                SidebarView(viewModel: viewModel)
+                // Drop Overlay
+                if isDragging {
+                    Rectangle()
+                        .fill(.ultraThinMaterial)
+                        .overlay(
+                            VStack(spacing: 12) {
+                                Image(systemName: "arrow.down.circle")
+                                    .font(.system(size: 32, weight: .light))
+                                Text("Release to open")
+                                    .font(.system(size: 13, weight: .medium))
+                            }
+                            .foregroundStyle(.white.opacity(0.7))
+                        )
+                        .transition(.opacity.animation(.easeInOut(duration: 0.2)))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Handle Drops on the Content Layer
+            .onDrop(of: ["public.file-url"], isTargeted: $isDragging) { providers in
+                guard let item = providers.first else { return false }
+                _ = item.loadObject(ofClass: URL.self) { url, error in
+                    if let url = url {
+                        // Defer import to next run loop to ensure drop completes
+                        DispatchQueue.main.async {
+                            // Add a small delay to ensure drag session is fully released
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                viewModel.importFile(url: url)
+                            }
+                        }
+                    }
+                }
+                return true
             }
             .loadingOverlay(isPresented: $viewModel.isProcessing)
+            .ignoresSafeArea()
+            
+            // ---------------------------------------------------------
+            // 2. CHROME LAYER (UI)
+            // ---------------------------------------------------------
+            VStack {
+                // Title Bar (Centered)
+                Text("SharpGlass")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .padding(.top, 12)
+                
+                Spacer()
+                
+                // Bottom Area (Stats + Pill)
+                ZStack(alignment: .bottom) {
+                    // Stats (Bottom Left)
+                    if let g = viewModel.gaussians {
+                        HStack {
+                            Text("\(g.pointCount.formatted()) splats")
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.white.opacity(0.35))
+                            Spacer()
+                        }
+                        .padding(.leading, 16)
+                        .padding(.bottom, 16)
+                    }
+                    
+                    // Liquid Glass Floating Pill Menu (Bottom Center)
+                    LiquidGlassPillMenu(
+                        canOpen: true,
+                        canGenerate: viewModel.selectedImage != nil && viewModel.gaussians == nil && viewModel.isAvailable,
+                        canSave: viewModel.gaussians != nil,
+                        onOpen: viewModel.loadImage,
+                        onGenerate: viewModel.generate3D,
+                        onSave: {
+                            let panel = NSSavePanel()
+                            panel.allowedContentTypes = [.init(filenameExtension: "ply")!]
+                            panel.nameFieldStringValue = "scene.ply"
+                            if panel.runModal() == .OK, let url = panel.url {
+                                viewModel.saveSplat(to: url)
+                            }
+                        }
+                    )
+                    .padding(.bottom, 30)
+                }
+            }
+            .ignoresSafeArea()
         }
-        .ignoresSafeArea()
+    }
 }
+
+// MARK: - Liquid Glass Pill Menu (Tahoe Spec)
+struct LiquidGlassPillMenu: View {
+    let canOpen: Bool
+    let canGenerate: Bool
+    let canSave: Bool
+    let onOpen: () -> Void
+    let onGenerate: () -> Void
+    let onSave: () -> Void
+    
+    var body: some View {
+        HStack(spacing: 0) {
+            // Open
+            Button(action: onOpen) {
+                Image(systemName: "folder")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(canOpen ? .white : .white.opacity(0.3))
+                    .frame(width: 52, height: 44)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canOpen)
+            
+            // Divider
+            Rectangle()
+                .fill(.white.opacity(0.15))
+                .frame(width: 0.5, height: 22)
+            
+            // Generate
+            Button(action: onGenerate) {
+                Image(systemName: "cube")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(canGenerate ? .white : .white.opacity(0.3))
+                    .frame(width: 52, height: 44)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canGenerate)
+            
+            // Divider
+            Rectangle()
+                .fill(.white.opacity(0.15))
+                .frame(width: 0.5, height: 22)
+            
+            // Save
+            Button(action: onSave) {
+                Image(systemName: "square.and.arrow.down")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(canSave ? .white : .white.opacity(0.3))
+                    .frame(width: 52, height: 44)
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSave)
+        }
+        // Liquid Glass: blur with black at 25% opacity (dark mode)
+        .background(
+            Capsule()
+                .fill(.black.opacity(0.15))
+                .background(
+                    Capsule()
+                        .fill(.ultraThinMaterial)
+                )
+        )
+        .clipShape(Capsule())
+        // Inner highlight (glass edge) - white gradient top-to-bottom
+        .overlay(
+            Capsule()
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [.white.opacity(0.35), .white.opacity(0.1)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: 0.5
+                )
+        )
+        // Drop shadow - blur 40px, Y 20px, 15% opacity
+        .shadow(color: .black.opacity(0.2), radius: 30, y: 15)
+    }
 }
+
 
 
 
@@ -122,23 +260,8 @@ struct SidebarView: View {
     var body: some View {
         ScrollView(showsIndicators: false) {
             VStack(spacing: 20) {
-                // Header
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("SHARPGLASS")
-                        .font(.system(size: 13, weight: .black, design: .rounded))
-                        .kerning(4)
-                        .foregroundStyle(.white)
-                    
-                    Text("3D GENERATIVE SYNTHESIS")
-                        .font(.system(size: 8, weight: .bold))
-                        .kerning(1)
-                        .foregroundStyle(.white.opacity(0.3))
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 20)
-                
                 if let error = viewModel.errorMessage {
-                    Text(error)
+                    Text(error.prefix(300))
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(.red.opacity(0.8))
                         .padding(10)
@@ -209,80 +332,42 @@ struct SidebarView: View {
                         WorkflowStep(number: 3, title: "Refine") {
                             VStack(spacing: 20) {
                                 VStack(spacing: 12) {
-                                    Picker("Mode", selection: $viewModel.cameraMode) {
-                                        Text("Object").tag(SharpViewModel.CameraMode.orbit)
-                                        Text("World").tag(SharpViewModel.CameraMode.fly)
-                                        Text("Cinema").tag(SharpViewModel.CameraMode.cinema)
-                                    }
-                                    .pickerStyle(SegmentedPickerStyle())
-                                    
-                                    // Style & Grading
-                                    VStack(alignment: .leading, spacing: 10) {
-                                        Text("STYLE")
+                                    // Splat scale control only
+                                    HStack {
+                                        Text("SPLAT SCALE")
                                             .font(.system(size: 9, weight: .bold))
                                             .foregroundStyle(.white.opacity(0.4))
-                                        
-                                        CameraSliderSimplified(value: $viewModel.exposure, label: "EXPOSURE", range: -2...2) {}
-                                        CameraSliderSimplified(value: $viewModel.gamma, label: "GAMMA", range: 0.5...2.5) {}
-                                        CameraSliderSimplified(value: $viewModel.vignetteStrength, label: "VIGNETTE", range: 0...1) {}
+                                        Spacer()
+                                        Text(String(format: "%.1f", viewModel.splatScale))
+                                            .font(.system(size: 9, design: .monospaced))
+                                            .foregroundStyle(.white.opacity(0.6))
                                     }
-                                    .padding(.vertical, 4)
+                                    Slider(value: $viewModel.splatScale, in: 0.1...2.0)
+                                        .controlSize(.mini)
                                     
-                                    Divider().background(Color.white.opacity(0.1))
-                                    
-                                    if viewModel.cameraMode == .cinema {
-                                        Picker("Style", selection: $viewModel.selectedStyle) {
-                                            Text("Orbit").tag(ParallaxStyle.orbit)
-                                            Text("Dolly").tag(ParallaxStyle.dolly)
-                                            Text("Pan").tag(ParallaxStyle.horizontal)
-                                            Text("Tilt").tag(ParallaxStyle.vertical)
-                                            Text("Ken Burns").tag(ParallaxStyle.kenBurns)
-                                        }
-                                        
-                                        HStack {
-                                            Text("Duration")
-                                                .font(.caption)
-                                                .foregroundColor(.white.opacity(0.6))
-                                            Slider(value: $viewModel.duration, in: 1...10, step: 0.5)
-                                                .controlSize(.mini)
-                                            Text(String(format: "%.1fs", viewModel.duration))
-                                                .font(.system(size: 9, design: .monospaced))
-                                                .frame(width: 36)
-                                        }
-                                        
-                                        Divider().background(Color.white.opacity(0.1))
-                                        
+                                    // Save Splat Button
+                                    if viewModel.gaussians != nil {
                                         Button(action: {
                                             let panel = NSSavePanel()
-                                            panel.allowedContentTypes = [.mpeg4Movie]
-                                            panel.nameFieldStringValue = "sharp_scene.mp4"
+                                            panel.allowedContentTypes = [.init(filenameExtension: "ply")!]
+                                            panel.nameFieldStringValue = "scene.ply"
                                             if panel.runModal() == .OK, let url = panel.url {
-                                                Task {
-                                                    try? await viewModel.exportVideo(url: url, duration: viewModel.duration)
-                                                }
+                                                viewModel.saveSplat(to: url)
                                             }
                                         }) {
                                             HStack {
-                                                if viewModel.isExporting {
-                                                    ProgressView().controlSize(.small)
-                                                    Text("\(Int(viewModel.exportProgress * 100))%")
-                                                } else {
-                                                    Image(systemName: "film")
-                                                    Text("EXPORT VIDEO")
-                                                }
+                                                Image(systemName: "square.and.arrow.down")
+                                                Text("SAVE SPLAT")
                                             }
-                                            .font(.system(size: 11, weight: .bold))
+                                            .font(.system(size: 9, weight: .bold))
                                             .frame(maxWidth: .infinity)
-                                            .frame(height: 32)
+                                            .frame(height: 28)
                                         }
-                                        .buttonStyle(CinematicButtonStyle(prominent: true))
-                                        .disabled(viewModel.isExporting)
+                                        .buttonStyle(CinematicButtonStyle())
                                     }
                                 }
                                 
-                                if viewModel.cameraMode != .cinema {
-                                    InputHelperView(mode: viewModel.cameraMode)
-                                }
+                                InputHelperView(mode: .orbit)
                             }
                         }
                     }

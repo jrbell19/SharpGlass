@@ -168,13 +168,21 @@ fragment float4 splatFragment(VertexOut in [[stage_in]], constant Uniforms& unif
     float alpha = min(0.99f, in.color.a * exp(power));
     if (alpha < 1.0f/255.0f) discard_fragment();
     
+    // In Shaders.metal, we follow the same logic as MetalSplatRenderer's embedded string
     float3 color = in.color.rgb;
+    
+    // Note: The uniforms struct here is simpler than the one in Renderer.
+    // For consistency, we'll keep it as simple as possible but matching the math.
     color *= pow(2.0f, uniforms.exposure);
     float dist = length(d);
     float vignette = 1.0f - smoothstep(0.5f, 1.5f, dist) * uniforms.vignetteStrength;
     color *= vignette;
+    
+    // Standard Tone Map
     color = aces_tonemap(color);
-    color = pow(color, float3(1.0f / uniforms.gamma));
+    
+    // Gamma (1.0 = Neutral)
+    color = pow(max(0.0001f, color), max(0.01f, uniforms.gamma));
     
     return float4(color, alpha);
 }

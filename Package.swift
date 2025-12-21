@@ -7,17 +7,20 @@ let package = Package(
         .macOS(.v15)
     ],
     products: [
-        .executable(name: "SharpGlass", targets: ["SharpGlass"])
+        .executable(name: "SharpGlass", targets: ["SharpGlassApp"])
     ],
     dependencies: [],
     targets: [
-        .executableTarget(
+        .target(
             name: "SharpGlass",
             dependencies: [],
             path: "Sources/SharpGlass",
-            resources: [
-                .process("Shaders.metal")
-            ]
+            exclude: ["Shaders.metal"]
+        ),
+        .executableTarget(
+            name: "SharpGlassApp",
+            dependencies: ["SharpGlass"],
+            path: "Sources/Main"
         ),
         .testTarget(
             name: "SharpGlassTests",

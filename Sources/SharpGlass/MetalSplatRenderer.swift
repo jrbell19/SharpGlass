@@ -1,5 +1,5 @@
 import Foundation
-import Metal
+@preconcurrency import Metal
 import MetalKit
 import simd
 
@@ -15,9 +15,13 @@ struct SplatData {
 struct MetalUniforms {
     var viewMatrix: matrix_float4x4    // 64
     var projectionMatrix: matrix_float4x4 // 128
-    var viewportSize: SIMD4<Float>     // 144 (xy=size, z=hasSH)
-    var styleParams: SIMD4<Float>      // 160 (x=exposure, y=gamma, z=vignette)
-    var cameraPosition: SIMD4<Float>   // 176
+    var invViewMatrix: matrix_float4x4    // 192
+    var invProjectionMatrix: matrix_float4x4 // 256
+    var viewportSize: SIMD4<Float>     // 272 (xy=size, z=hasSH)
+    var styleParams: SIMD4<Float>      // 288 (x=exposure, y=gamma, z=vignette, w=splatScale)
+    var cameraPosition: SIMD4<Float>   // 304 (xyz=pos, w=colorMode)
+    var colorParams: SIMD4<Float>      // 320 (x=saturation, y, z, w)
+    var affordanceParams: SIMD4<Float> // 336 (xyz = orbitTarget, w = isNavigating)
 }
 
 // MARK: - Renderer
@@ -27,18 +31,37 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private var pipelineState: MTLRenderPipelineState?
+    private var gridPipelineState: MTLRenderPipelineState?
     private var depthStencilState: MTLDepthStencilState?
     
-    // Geometry buffers
-    // Geometry buffers
+    // Compute Pipeline States for Sorting
+    private var calcDepthsPipelineState: MTLComputePipelineState?
+    private var histogramPipelineState: MTLComputePipelineState?
+    private var prefixSumPipelineState: MTLComputePipelineState?
+    private var scatterPipelineState: MTLComputePipelineState?
+    private var clearBufferPipelineState: MTLComputePipelineState?
+    
+    // Sorting Buffers (Ping-Pong)
+    private var sortKeysBufferA: MTLBuffer?
+    private var sortKeysBufferB: MTLBuffer?
+    private var sortIndicesBufferA: MTLBuffer?
+    private var sortIndicesBufferB: MTLBuffer?
+    private var histogramBuffer: MTLBuffer?
+    private var prefixSumBuffer: MTLBuffer?
+    
     private var splatBuffer: MTLBuffer?
     private var shBuffer: MTLBuffer?
     private var emptyBuffer: MTLBuffer?
     private var splatCount: Int = 0
     private var currentSplatID: UUID?
     
+    // Safety limit to prevent GPU memory crashes
+    private static let MAX_SPLAT_COUNT = 2_000_000
+    
     // Camera state
     var cameraPosition: CameraPosition = .center
+    var orbitTarget: SIMD3<Double> = SIMD3(0, 0, 0)
+    var isNavigating: Bool = false
     var aspectRatio: Float = 1.0
     var viewportSize: SIMD2<Float> = SIMD2<Float>(1024, 1024)
     
@@ -53,8 +76,14 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
         
         metalKitView.device = device
         metalKitView.delegate = self
-        metalKitView.colorPixelFormat = .bgra8Unorm
+        // Use bgra10_xr for HDR/EDR support on modern Macs
+        metalKitView.colorPixelFormat = .bgra10_xr
         metalKitView.depthStencilPixelFormat = .depth32Float
+        
+        if let layer = metalKitView.layer as? CAMetalLayer {
+            layer.wantsExtendedDynamicRangeContent = true
+            layer.colorspace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+        }
         
         self.emptyBuffer = device.makeBuffer(length: 4, options: .storageModeShared)
         
@@ -76,9 +105,13 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
         struct Uniforms {
             float4x4 viewMatrix;
             float4x4 projectionMatrix;
+            float4x4 invViewMatrix;
+            float4x4 invProjectionMatrix;
             float4 viewportSize;  // xy=size, z=hasSH
-            float4 styleParams;   // x=exposure, y=gamma, z=vignette
-            float4 cameraPosition; // xyz=pos
+            float4 styleParams;   // x=exposure, y=gamma, z=vignette, w=splatScale
+            float4 cameraPosition; // xyz=pos, w=colorMode
+            float4 colorParams;    // x=saturation
+            float4 affordanceParams; // xyz=orbitTarget, w=isNavigating
         };
 
         struct SplatData {
@@ -143,6 +176,75 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
             );
         }
 
+        // Grid & Pivot Affordances
+        vertex VertexOut gridVertex(uint vid [[vertex_id]], constant Uniforms &uniforms [[buffer(1)]]) {
+            // Full screen quad
+            float2 positions[4] = { float2(-1,-1), float2(1,-1), float2(-1,1), float2(1,1) };
+            float2 uv = positions[vid];
+            
+            VertexOut out;
+            out.position = float4(uv, 1.0, 1.0);
+            out.uv = uv;
+            return out;
+        }
+
+        /// Renders an infinite ground grid on the Y=0 plane using raycasting.
+        /// Also projects and renders the yellow orbit pivot point during navigation.
+        fragment float4 gridFragment(VertexOut in [[stage_in]], constant Uniforms &uniforms [[buffer(1)]]) {
+            // Raycast Ground Grid
+            float4x4 invView = uniforms.invViewMatrix;
+            float4x4 invProj = uniforms.invProjectionMatrix;
+            
+            float4 ndc = float4(in.uv, 0.0, 1.0); // Near plane
+            float4 nearWorld = invView * invProj * ndc;
+            nearWorld /= nearWorld.w;
+            
+            float4 camPos = invView * float4(0,0,0,1);
+            float3 rayDir = normalize(nearWorld.xyz - camPos.xyz);
+            
+            // Plane intersection (Y=+2.0, below splats in ml-sharp Y-down coords)
+            float t = (2.0 - camPos.y) / rayDir.y;
+            if (t < 0) discard_fragment();
+            
+            float3 worldPos = camPos.xyz + rayDir * t;
+            
+            // Fading
+            float dist = length(worldPos.xz);
+            float alpha = 1.0 - smoothstep(5.0, 20.0, dist);
+            if (alpha <= 0) discard_fragment();
+            
+            // Grid lines
+            float2 grid = abs(fract(worldPos.xz - 0.5) - 0.5) / (fwidth(worldPos.xz) + 0.001);
+            float line = min(grid.x, grid.y);
+            float gridVal = 1.0 - min(line, 1.0);
+            
+            // Axes
+            float axisX = 1.0 - min(abs(worldPos.z) / (fwidth(worldPos.z) + 0.001), 1.0);
+            float axisZ = 1.0 - min(abs(worldPos.x) / (fwidth(worldPos.x) + 0.001), 1.0);
+            
+            float4 color = float4(0.3, 0.3, 0.3, 0.2 * alpha);
+            if (gridVal > 0) color = float4(0.5, 0.5, 0.5, 0.3 * alpha);
+            if (axisX > 0) color = float4(1.0, 0.2, 0.2, 0.5 * alpha); // X axis
+            if (axisZ > 0) color = float4(0.2, 0.2, 1.0, 0.5 * alpha); // Z axis
+            
+            // Pivot Point Overlay
+            float3 orbitTarget = uniforms.affordanceParams.xyz;
+            bool isNavigating = uniforms.affordanceParams.w > 0.5;
+            
+            if (isNavigating) {
+                // Project orbit target
+                float4 targetClip = uniforms.projectionMatrix * uniforms.viewMatrix * float4(orbitTarget, 1.0);
+                float2 targetNDC = targetClip.xy / targetClip.w;
+                float d = length(in.uv - targetNDC);
+                float pivot = 1.0 - smoothstep(0.005, 0.007, d);
+                if (pivot > 0) color = mix(color, float4(1.0, 1.0, 0.0, 0.8), pivot);
+            }
+            
+            return color;
+        }
+
+        /// Main splat vertex shader. Projects 3D Gaussians into 2D screenspace.
+        /// Handles SH color computation and covariance-to-ellipse math.
         vertex VertexOut splatVertex(uint vertexID [[vertex_id]],
                                      uint instanceID [[instance_id]],
                                      const device SplatData* splats [[buffer(0)]],
@@ -168,23 +270,38 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
 
             float3x3 R = quadToMat(splat.quaternion);
             float3x3 S = float3x3(0);
-            S[0][0] = splat.scale.x; S[1][1] = splat.scale.y; S[2][2] = splat.scale.z;
+            float s = uniforms.styleParams.w; // splatScale
+            S[0][0] = splat.scale.x * s; S[1][1] = splat.scale.y * s; S[2][2] = splat.scale.z * s;
             float3x3 M = R * S;
             float3x3 Sigma = M * transpose(M);
 
-            float f = uniforms.projectionMatrix[1][1];
+            float focal_y = uniforms.projectionMatrix[1][1] * uniforms.viewportSize.y / 2.0f;
+            float focal_x = uniforms.projectionMatrix[0][0] * uniforms.viewportSize.x / 2.0f;
+            
             float x = p_view.x; float y = p_view.y; float z = p_view.z;
             
             float3x3 J = float3x3(
-                f / z,   0,       -(f * x) / (z * z),
-                0,       f / z,   -(f * y) / (z * z),
-                0,       0,       0
+                focal_x / z,   0,       -(focal_x * x) / (z * z),
+                focal_y / z,   0,       -(focal_y * y) / (z * z), // Swapped row/column order for float3x3? 
+                0,             0,       0
+            );
+            // Metal float3x3 is column-major. 
+            // We want:
+            // [ fx/z, 0, -fx*x/z^2 ]
+            // [ 0, fy/z, -fy*y/z^2 ]
+            // [ 0, 0, 0 ]
+            
+            J = float3x3(
+                float3(focal_x / z, 0, 0),
+                float3(0, focal_y / z, 0),
+                float3(-(focal_x * x) / (z * z), -(focal_y * y) / (z * z), 0)
             );
             
             float3x3 W = float3x3(uniforms.viewMatrix[0].xyz, uniforms.viewMatrix[1].xyz, uniforms.viewMatrix[2].xyz);
             float3x3 T = J * W;
             float3x3 cov2D = T * Sigma * transpose(T);
             
+            // Mip-Splatting: 0.3 pixel anti-aliasing filter
             cov2D[0][0] += 0.3f;
             cov2D[1][1] += 0.3f;
 
@@ -198,9 +315,13 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
             float2 offset = localQuad[vertexID] * radius;
             
             float4 p_clip = uniforms.projectionMatrix * p_view;
+            if (p_clip.w < 0.05f) { out.position = float4(0,0,0,1); return out; }
             float2 p_ndc = p_clip.xy / p_clip.w;
             float2 ndc_offset = offset * (2.0f / uniforms.viewportSize.xy);
             
+            // Critical: We use a small Z offset for splats to distinguish them from the grid 
+            // if we were using depth testing, but for over-blending we just need to preserve 
+            // the relative order from sorting.
             out.position = float4(p_ndc + ndc_offset, p_clip.z / p_clip.w, 1.0);
             out.uv = offset;
             
@@ -224,22 +345,160 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
             if (alpha < 1.0f/255.0f) discard_fragment();
             
             float3 color = in.color.rgb;
-            
-            // Apply Grading
+        
+            // --- TONE MAPPING ---
             float exposure = uniforms.styleParams.x;
             float gamma = uniforms.styleParams.y;
             float vignetteStrength = uniforms.styleParams.z;
+            float saturationVal = uniforms.colorParams.x;
+            int colorMode = (int)uniforms.cameraPosition.w;
             
-            color *= pow(2.0f, exposure);
+            color *= exp2(exposure);
             float dist = length(d);
             float vignette = 1.0f - smoothstep(0.5f, 1.5f, dist) * vignetteStrength;
             color *= vignette;
             
-            color = aces_tonemap(color);
-            color = pow(color, float3(1.0f / max(0.1f, gamma)));
+            // Saturation adjustment in Linear space
+            float luma = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+            color = mix(float3(luma), color, saturationVal);
+            
+            if (colorMode == 1) { // FILMIC (ACES)
+                // Refined ACES Filmic Curve (Narkowicz 2015)
+                const float a = 2.51f;
+                const float b = 0.03f;
+                const float c = 2.43f;
+                const float d = 0.59f;
+                const float e = 0.14f;
+                color = (color * (a * color + b)) / (color * (c * color + d) + e);
+            }
+            
+            // Note: Since we use bgra10_xr (Extended Linear sRGB), 
+            // the OS handles display gamma. We output values that represent 
+            // the intended color in that space.
+            // If the input was sRGB and we want to match, we usually want 
+            // a gamma close to 1.0 if our input data is already sRGB-ish, 
+            // but for a truly linear pipeline, we might need a custom curve.
+            color = pow(max(0.0001f, color), max(0.01f, gamma));
             
             return float4(color, alpha);
         }
+
+        // --- GPU SORT KERNELS (RADIX SORT) ---
+        
+        kernel void calculateDepths(uint id [[thread_position_in_grid]],
+                                   device const SplatData* splats [[buffer(0)]],
+                                   device uint* keys [[buffer(1)]],
+                                   device uint* indices [[buffer(2)]],
+                                   constant Uniforms& uniforms [[buffer(3)]]) {
+            if (id >= uint(uniforms.viewportSize.w)) return;
+            
+            float4 p_view = uniforms.viewMatrix * float4(splats[id].position.xyz, 1.0);
+            float depth = p_view.z;
+            
+            // BACK-TO-FRONT SORTING (Most distant first)
+            // Range of Z is [Near, Far] where Near is e.g. -0.1 and Far is e.g. -100.
+            // We want to sort Ascending: -100.0, -99.9, ..., -0.1.
+            // Standard float-to-uint mapping for monotonic sorting:
+            uint u = as_type<uint>(depth);
+            uint mask = (u >> 31) ? ~u : u ^ 0x80000000;
+            keys[id] = mask;
+            indices[id] = id;
+        }
+
+        kernel void histogram(uint id [[thread_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint bid [[threadgroup_position_in_grid]],
+                             device const uint* keys [[buffer(0)]],
+                             device uint* histograms [[buffer(1)]],
+                             constant uint& bitOffset [[buffer(2)]],
+                             constant uint& count [[buffer(3)]]) {
+            threadgroup atomic_uint localHist[256];
+            if (tid < 256) atomic_store_explicit(&localHist[tid], 0, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            
+            if (id < count) {
+                uint key = keys[id];
+                uint bucket = (key >> bitOffset) & 0xFF;
+                atomic_fetch_add_explicit(&localHist[bucket], 1, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            
+            if (tid < 256) {
+                histograms[bid * 256 + tid] = atomic_load_explicit(&localHist[tid], memory_order_relaxed);
+            }
+        }
+
+        kernel void prefixSum(uint id [[thread_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]],
+                               device uint* histograms [[buffer(0)]],
+                               constant uint& threadgroupCount [[buffer(1)]]) {
+            // id is 0..255 (one thread per bucket)
+            if (tid >= 256) return;
+            
+            threadgroup uint bucketTotals[256];
+            
+            // 1. Calculate the total for this bucket across all threadgroups
+            uint total = 0;
+            for (uint j = 0; j < threadgroupCount; j++) {
+                total += histograms[j * 256 + tid];
+            }
+            bucketTotals[tid] = total;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            
+            // 2. Prefix sum the bucket totals (serial for 256 elements is fine)
+            if (tid == 0) {
+                uint sum = 0;
+                for (uint i = 0; i < 256; i++) {
+                    uint val = bucketTotals[i];
+                    bucketTotals[i] = sum;
+                    sum += val;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            
+            // 3. Write out the final offsets for each threadgroup in this bucket
+            uint bucketStart = bucketTotals[tid];
+            uint runningSum = bucketStart;
+            for (uint j = 0; j < threadgroupCount; j++) {
+                uint val = histograms[j * 256 + tid];
+                histograms[j * 256 + tid] = runningSum;
+                runningSum += val;
+            }
+        }
+
+        kernel void scatter(uint id [[thread_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint bid [[threadgroup_position_in_grid]],
+                            device const uint* srcKeys [[buffer(0)]],
+                            device const uint* srcIndices [[buffer(1)]],
+                            device uint* dstKeys [[buffer(2)]],
+                            device uint* dstIndices [[buffer(3)]],
+                            device uint* histograms [[buffer(4)]],
+                            constant uint& bitOffset [[buffer(5)]],
+                            constant uint& count [[buffer(6)]]) {
+            threadgroup atomic_uint localOffsets[256];
+            if (tid < 256) {
+                atomic_store_explicit(&localOffsets[tid], histograms[bid * 256 + tid], memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            
+            if (id < count) {
+                uint key = srcKeys[id];
+                uint index = srcIndices[id];
+                uint bucket = (key >> bitOffset) & 0xFF;
+                
+                uint slot = atomic_fetch_add_explicit(&localOffsets[bucket], 1, memory_order_relaxed);
+                dstKeys[slot] = key;
+                dstIndices[slot] = index;
+            }
+        }
+
+        kernel void clearBuffer(uint id [[thread_position_in_grid]],
+                               device uint* buffer [[buffer(0)]],
+                               constant uint& count [[buffer(1)]]) {
+            if (id < count) buffer[id] = 0;
+        }
+
         """
         
         do {
@@ -270,9 +529,31 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
             
             pipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
             
+            // Grid Pipeline
+            let gridVertexFunc = library.makeFunction(name: "gridVertex")!
+            let gridFragmentFunc = library.makeFunction(name: "gridFragment")!
+            descriptor.vertexFunction = gridVertexFunc
+            descriptor.fragmentFunction = gridFragmentFunc
+            gridPipelineState = try device.makeRenderPipelineState(descriptor: descriptor)
+            
+            // --- Compute Pipelines ---
+            let calcDepthsFunc = library.makeFunction(name: "calculateDepths")!
+            let histogramFunc = library.makeFunction(name: "histogram")!
+            let prefixSumFunc = library.makeFunction(name: "prefixSum")!
+            let scatterFunc = library.makeFunction(name: "scatter")!
+            
+            calcDepthsPipelineState = try device.makeComputePipelineState(function: calcDepthsFunc)
+            histogramPipelineState = try device.makeComputePipelineState(function: histogramFunc)
+            prefixSumPipelineState = try device.makeComputePipelineState(function: prefixSumFunc)
+            scatterPipelineState = try device.makeComputePipelineState(function: scatterFunc)
+            
+            if let clearFunc = library.makeFunction(name: "clearBuffer") {
+                clearBufferPipelineState = try device.makeComputePipelineState(function: clearFunc)
+            }
+            
             let depthDescriptor = MTLDepthStencilDescriptor()
             depthDescriptor.depthCompareFunction = .lessEqual
-            depthDescriptor.isDepthWriteEnabled = true
+            depthDescriptor.isDepthWriteEnabled = false // HIGH QUALITY: Disable depth write for Gaussian blending
             depthStencilState = device.makeDepthStencilState(descriptor: depthDescriptor)
             
             view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
@@ -281,17 +562,20 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
         }
     }
     
-    // Sort State
-    private var sortBuffer: MTLBuffer?
-    private var splatPositions: [SIMD3<Float>] = [] // CPU Copy for Depth Calc
-    
+    // Sorting State (GPU)
     func load(gaussians: GaussianSplatData) {
         if gaussians.id == currentSplatID { return }
         
-        var splats: [SplatData] = []
-        // Keep a separate position array for fast sorting without striding full struct
-        splatPositions.removeAll(keepingCapacity: true)
+        // Safety check: Prevent GPU memory overflow
+        if gaussians.pointCount > Self.MAX_SPLAT_COUNT {
+            print("Metal Error: Splat count (\(gaussians.pointCount)) exceeds safe limit (\(Self.MAX_SPLAT_COUNT))")
+            print("Metal Error: This would cause GPU memory overflow and crash the system.")
+            print("Metal Error: Please prune the splat dataset before loading.")
+            return
+        }
         
+        var splats: [SplatData] = []
+
         for i in 0..<gaussians.pointCount {
             splats.append(SplatData(
                 position: SIMD4<Float>(gaussians.positions[i].x, gaussians.positions[i].y, gaussians.positions[i].z, 1.0),
@@ -299,16 +583,54 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
                 scale: SIMD4<Float>(gaussians.scales[i].x, gaussians.scales[i].y, gaussians.scales[i].z, gaussians.opacities[i]),
                 quaternion: gaussians.rotations[i]
             ))
-            splatPositions.append(gaussians.positions[i])
         }
         
         self.splatCount = splats.count
         let size = splats.count * MemoryLayout<SplatData>.stride
+        
+        // Explicitly nil out old buffers before allocating new ones to help ARC/Metal
+        self.splatBuffer = nil
+        self.sortKeysBufferA = nil
+        self.sortKeysBufferB = nil
+        self.sortIndicesBufferA = nil
+        self.sortIndicesBufferB = nil
+        self.histogramBuffer = nil
+        self.shBuffer = nil
+        
         self.splatBuffer = device.makeBuffer(bytes: splats, length: size, options: .storageModeShared)
         
-        // Initialize indices [0, 1, 2...]
-        let indices = Array(0..<UInt32(splatCount))
-        self.sortBuffer = device.makeBuffer(bytes: indices, length: splatCount * MemoryLayout<UInt32>.stride, options: .storageModeShared)
+        // --- Initialize GPU Sorting Buffers ---
+        let elementCount = splatCount
+        let uint32Size = MemoryLayout<UInt32>.stride
+        
+        self.sortKeysBufferA = device.makeBuffer(length: elementCount * uint32Size, options: .storageModePrivate)
+        self.sortKeysBufferB = device.makeBuffer(length: elementCount * uint32Size, options: .storageModePrivate)
+        self.sortIndicesBufferA = device.makeBuffer(length: elementCount * uint32Size, options: .storageModePrivate)
+        self.sortIndicesBufferB = device.makeBuffer(length: elementCount * uint32Size, options: .storageModePrivate)
+        
+        // Fill Indices A with [0, 1, 2, ...]
+        let initialIndices = (0..<UInt32(elementCount)).map { $0 }
+        let tempIndicesBuffer = device.makeBuffer(bytes: initialIndices, length: elementCount * uint32Size, options: .storageModeShared)
+        
+        // Copy to Private Buffer A
+        if let commandBuffer = commandQueue.makeCommandBuffer(),
+           let encoder = commandBuffer.makeBlitCommandEncoder() {
+            encoder.copy(from: tempIndicesBuffer!, sourceOffset: 0, to: sortIndicesBufferA!, destinationOffset: 0, size: elementCount * uint32Size)
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+        }
+        
+        self.finalSortedIndicesBuffer = sortIndicesBufferA
+        
+        // Radix Sort needs Histograms and Prefix Sums
+        // For 8-bit radix, we have 256 bins.
+        // Parallel radix sort often uses tiered histograms (per block).
+        // To keep it simple but GPU-efficient, we'll use a 16-bit radix (65536 bins) 
+        // or multiple 8-bit passes. Let's do 4 passes of 8 bits.
+        // We need 256 * (number of threadgroups) bins.
+        let threadgroupCount = (elementCount + 255) / 256
+        self.histogramBuffer = device.makeBuffer(length: 256 * threadgroupCount * uint32Size, options: .storageModePrivate)
         
         // SH Buffer
         if !gaussians.shs.isEmpty {
@@ -319,97 +641,129 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
         
         self.currentSplatID = gaussians.id
         
-        print("Metal: Loaded \(splatCount) splats. SH Data: \(self.shBuffer != nil)")
+        print("Metal: Loaded \(splatCount) splats. GPU Sort Buffers allocated. SH Data: \(self.shBuffer != nil)")
     }
     
     // Sorting State
-    private var isSorting = false
-    private let sortQueue = DispatchQueue(label: "com.sharpglass.sort", qos: .userInteractive)
+    private var isSorting = false // No longer used for CPU sort, but kept for logic if needed
+    // sortQueue is no longer needed as everything is on GPU Command Queue
     
     // Style State
     var exposure: Float = 0
-    var gamma: Float = 2.2
+    var gamma: Float = 1.0
     var vignetteStrength: Float = 0.5
+    var splatScale: Float = 1.0
+    var colorMode: Int = 0 
+    var saturation: Float = 1.0
     
-    private func depthSort() {
-        guard splatCount > 0, !isSorting else { return }
+    private var finalSortedIndicesBuffer: MTLBuffer?
+
+    /// Dispatches the GPU-based parallel radix sort.
+    /// This is the core performance bottleneck, moved to GPU to maintain 60FPS.
+    /// 1. Calculate Depths in view space.
+    /// 2. Perform 4-pass Radix Sort (8-bits per pass).
+    private func dispatchGPUPointsSort(commandBuffer: MTLCommandBuffer, viewMatrix: matrix_float4x4) {
+        guard let calcDepths = calcDepthsPipelineState,
+              let histPipe = histogramPipelineState,
+              let sumPipe = prefixSumPipelineState,
+              let scatterPipe = scatterPipelineState,
+              let clearPipe = clearBufferPipelineState,
+              let splats = splatBuffer,
+              let keysA = sortKeysBufferA,
+              let keysB = sortKeysBufferB,
+              let indicesA = sortIndicesBufferA,
+              let indicesB = sortIndicesBufferB,
+              let histBuf = histogramBuffer,
+              splatCount > 0 else { return }
         
-        // Capture state for background thread
-        let eye = SIMD3<Float>(Float(cameraPosition.x), Float(cameraPosition.y), Float(cameraPosition.z))
-        let target: SIMD3<Float>
-        if let t = cameraPosition.target {
-            target = SIMD3<Float>(Float(t.x), Float(t.y), Float(t.z))
-        } else {
-            target = eye + SIMD3<Float>(0, 0, -1)
+        let threadgroupSize = 256
+        let threadgroupCount = (splatCount + threadgroupSize - 1) / threadgroupSize
+        
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.label = "GPU Sort Encoder"
+        
+        // 1. Calculate Depths
+        encoder.setComputePipelineState(calcDepths)
+        encoder.setBuffer(splats, offset: 0, index: 0)
+        encoder.setBuffer(keysA, offset: 0, index: 1)
+        encoder.setBuffer(indicesA, offset: 0, index: 2)
+        
+        var uniforms = MetalUniforms(
+            viewMatrix: viewMatrix,
+            projectionMatrix: matrix_float4x4(0),
+            invViewMatrix: viewMatrix.inverse,
+            invProjectionMatrix: matrix_float4x4(0),
+            viewportSize: SIMD4<Float>(0, 0, 0, Float(splatCount)),
+            styleParams: SIMD4<Float>(0, 0, 0, 0),
+            cameraPosition: SIMD4<Float>(0, 0, 0, 0),
+            colorParams: SIMD4<Float>(0, 0, 0, 0),
+            affordanceParams: SIMD4<Float>(0, 0, 0, 0)
+        )
+        encoder.setBytes(&uniforms, length: MemoryLayout<MetalUniforms>.stride, index: 3)
+        encoder.dispatchThreadgroups(MTLSize(width: threadgroupCount, height: 1, depth: 1), 
+                                  threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1))
+        
+        encoder.memoryBarrier(scope: .buffers)
+        
+        // 2. Radix Sort (4 passes of 8 bits)
+        var srcKeys = keysA
+        var dstKeys = keysB
+        var srcIndices = indicesA
+        var dstIndices = indicesB
+        
+        for i in 0..<4 {
+            var bitOffset = uint(i * 8)
+            var uCount = uint(splatCount)
+            var uTGCount = uint(threadgroupCount)
+            var hCount = uint(256 * threadgroupCount)
+            
+            // a. Clear Histogram (Using compute instead of blit to stay in same encoder)
+            encoder.setComputePipelineState(clearPipe)
+            encoder.setBuffer(histBuf, offset: 0, index: 0)
+            encoder.setBytes(&hCount, length: 4, index: 1)
+            let hTGCount = (Int(hCount) + 255) / 256
+            encoder.dispatchThreadgroups(MTLSize(width: hTGCount, height: 1, depth: 1), 
+                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            
+            // b. Histogram
+            encoder.setComputePipelineState(histPipe)
+            encoder.setBuffer(srcKeys, offset: 0, index: 0)
+            encoder.setBuffer(histBuf, offset: 0, index: 1)
+            encoder.setBytes(&bitOffset, length: 4, index: 2)
+            encoder.setBytes(&uCount, length: 4, index: 3)
+            encoder.dispatchThreadgroups(MTLSize(width: threadgroupCount, height: 1, depth: 1), 
+                                      threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1))
+            
+            encoder.memoryBarrier(scope: .buffers)
+            
+            // c. Prefix Sum
+            encoder.memoryBarrier(scope: .buffers)
+            encoder.setComputePipelineState(sumPipe)
+            encoder.setBuffer(histBuf, offset: 0, index: 0)
+            encoder.setBytes(&uTGCount, length: 4, index: 1)
+            encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), 
+                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            
+            // d. Scatter
+            encoder.memoryBarrier(scope: .buffers)
+            encoder.setComputePipelineState(scatterPipe)
+            encoder.setBuffer(srcKeys, offset: 0, index: 0)
+            encoder.setBuffer(srcIndices, offset: 0, index: 1)
+            encoder.setBuffer(dstKeys, offset: 0, index: 2)
+            encoder.setBuffer(dstIndices, offset: 0, index: 3)
+            encoder.setBuffer(histBuf, offset: 0, index: 4)
+            encoder.setBytes(&bitOffset, length: 4, index: 5)
+            encoder.setBytes(&uCount, length: 4, index: 6)
+            encoder.dispatchThreadgroups(MTLSize(width: threadgroupCount, height: 1, depth: 1), 
+                                      threadsPerThreadgroup: MTLSize(width: threadgroupSize, height: 1, depth: 1))
+            
+            // Swap ping-pong
+            let tempK = srcKeys; srcKeys = dstKeys; dstKeys = tempK
+            let tempI = srcIndices; srcIndices = dstIndices; dstIndices = tempI
         }
-        let forward = normalize(target - eye)
         
-        // Capture immutable copies of data needed for sort
-        // Note: splatPositions is constant once loaded, so safe to read if we don't reload mid-sort.
-        // But to be safe vs load(), load() should cancel or block. 
-        // For now, assuming load() happens rarely.
-        let count = self.splatCount
-        let positions = self.splatPositions 
-        
-        isSorting = true
-        
-        sortQueue.async { [weak self] in
-            guard let self = self else { return }
-            
-            // 1. Calculate Depths
-            // Create a temporary array of (index, depth)
-            // Using a simple struct to hold index+depth
-            struct DepthItem {
-                var index: UInt32
-                var depth: Float
-            }
-            
-            var depths = [DepthItem]()
-            depths.reserveCapacity(count)
-            
-            // Optimized Loop (UnsafeBufferPointer for speed)
-            positions.withUnsafeBufferPointer { buffer in
-                guard let ptr = buffer.baseAddress else { return }
-                for i in 0..<count {
-                    let p = ptr[i]
-                    // Dot product: (p - eye) . forward
-                    let dx = p.x - eye.x
-                    let dy = p.y - eye.y
-                    let dz = p.z - eye.z
-                    let depth = dx * forward.x + dy * forward.y + dz * forward.z
-                    depths.append(DepthItem(index: UInt32(i), depth: depth))
-                }
-            }
-            
-            // 2. Sort (Back-to-Front)
-            // Descending depth
-            depths.sort { $0.depth > $1.depth }
-            
-            // 3. Extract Indices
-            let sortedIndices = depths.map { $0.index }
-            
-            // 4. Upload to GPU (Main Thread)
-            DispatchQueue.main.async {
-                // Check if splat count changed (reloaded)
-                if self.splatCount == count {
-                    // Update GPU buffer
-                    // using replaceRegion or making a new buffer? 
-                    // contents().copyMemory is fastest for shared buffer.
-                    if let sortBuffer = self.sortBuffer {
-                        let contents = sortBuffer.contents().bindMemory(to: UInt32.self, capacity: count)
-                        sortedIndices.withUnsafeBufferPointer { srcBuf in
-                            if let src = srcBuf.baseAddress {
-                                contents.update(from: src, count: count)
-                            }
-                        }
-                        
-                        // Notify GPU buffer modified
-                        sortBuffer.didModifyRange(0..<count * MemoryLayout<UInt32>.stride)
-                    }
-                }
-                self.isSorting = false
-            }
-        }
+        encoder.endEncoding()
+        self.finalSortedIndicesBuffer = srcIndices
     }
     
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -418,36 +772,56 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
     }
     
     func draw(in view: MTKView) {
-        // ... (existing implementation) ...
         guard let drawable = view.currentDrawable,
               let descriptor = view.currentRenderPassDescriptor,
               let pipeline = pipelineState,
-              let buffer = splatBuffer,
-              let sortBuf = sortBuffer else { return }
+              let buffer = splatBuffer else { return }
         
-        depthSort()
-        
-        // ... setup matrices ...
         let viewMatrix = makeViewMatrix()
+        
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        
+        // 1. GPU Sort
+        dispatchGPUPointsSort(commandBuffer: commandBuffer, viewMatrix: viewMatrix)
+        
+        // 2. Render
         let projMatrix = makePerspectiveMatrix(fovRadians: degreesToRadians(60), aspect: aspectRatio, near: 0.1, far: 1000)
         var uniforms = MetalUniforms(
             viewMatrix: viewMatrix,
             projectionMatrix: projMatrix,
-            viewportSize: SIMD4<Float>(Float(viewportSize.x), Float(viewportSize.y), shBuffer != nil ? 1.0 : 0.0, 0.0),
-            styleParams: SIMD4<Float>(exposure, gamma, vignetteStrength, 0.0),
-            cameraPosition: SIMD4<Float>(Float(cameraPosition.x), Float(cameraPosition.y), Float(cameraPosition.z), 1.0)
+            invViewMatrix: viewMatrix.inverse,
+            invProjectionMatrix: projMatrix.inverse,
+            viewportSize: SIMD4<Float>(Float(viewportSize.x), Float(viewportSize.y), Float(shBuffer != nil ? 1.0 : 0.0), Float(splatCount)),
+            styleParams: SIMD4<Float>(exposure, gamma, vignetteStrength, splatScale),
+            cameraPosition: SIMD4<Float>(Float(cameraPosition.x), Float(cameraPosition.y), Float(cameraPosition.z), Float(colorMode)),
+            colorParams: SIMD4<Float>(saturation, 0, 0, 0),
+            affordanceParams: SIMD4<Float>(Float(orbitTarget.x), Float(orbitTarget.y), Float(orbitTarget.z), isNavigating ? 1.0 : 0.0)
         )
         
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
+        guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else { return }
         
         encoder.setRenderPipelineState(pipeline)
         if let ds = depthStencilState { encoder.setDepthStencilState(ds) }
         
+        // --- GRID PASS (DISABLED - was confusing users) ---
+        /*
+        if let gridPSO = gridPipelineState {
+            encoder.setRenderPipelineState(gridPSO)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalUniforms>.stride, index: 1)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            encoder.setRenderPipelineState(pipeline)
+        }
+        */
+        
         encoder.setVertexBuffer(buffer, offset: 0, index: 0)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<MetalUniforms>.stride, index: 1)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<MetalUniforms>.stride, index: 1)
-        encoder.setVertexBuffer(sortBuf, offset: 0, index: 2)
+        
+        // Final sorted indices are in finalSortedIndicesBuffer
+        if let sortBuf = finalSortedIndicesBuffer {
+            encoder.setVertexBuffer(sortBuf, offset: 0, index: 2)
+        }
         
         if let shBuf = shBuffer {
             encoder.setVertexBuffer(shBuf, offset: 0, index: 3)
@@ -468,7 +842,9 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
         if isCapturingFrame {
             let capturedTexture = drawable.texture
             commandBuffer.addCompletedHandler { [weak self] _ in
-                self?.lastCapturedTexture = capturedTexture
+                DispatchQueue.main.async {
+                    self?.lastCapturedTexture = capturedTexture
+                }
             }
         }
         
@@ -483,7 +859,7 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
     // Synchronous Snapshot for Offline Render Loop
     // This blocks Main Thread but that's what we want for "Offline" perfect rendering
     func snapshot(at size: CGSize) -> CVPixelBuffer? {
-        guard let device = MTLCreateSystemDefaultDevice() else { return nil } 
+        guard let _ = MTLCreateSystemDefaultDevice() else { return nil } 
         // We reuse the existing device actually
         
         // 1. Create a transient texture for offscreen rendering if not using the view
@@ -540,7 +916,7 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
             target = eye + vector_float3(0, 0, -1)
         }
         
-        let up = vector_float3(0, 1, 0) // World Up is +Y (Metal standard for camera basis)
+        let up = vector_float3(0, -1, 0) // ml-sharp uses Y-down, so up is -Y
         
         return matrix_look_at_right_hand(eye: eye, target: target, up: up)
     }
@@ -569,10 +945,11 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
         let xs = ys / aspect
         let zs = far / (near - far)
         
+        // Standard right-hand perspective projection for Metal NDC
         return matrix_float4x4(columns: (
-            vector_float4(-xs, 0, 0, 0),   // x scale (flipped to fix mirroring)
-            vector_float4(0, -ys, 0, 0),   // y scale (negated to flip Y-down to Y-up)
-            vector_float4(0, 0, zs, -1),   // z remapping (standard RH projection)
+            vector_float4(xs, 0, 0, 0),
+            vector_float4(0, ys, 0, 0),
+            vector_float4(0, 0, zs, -1),
             vector_float4(0, 0, zs * near, 0)
         ))
     }

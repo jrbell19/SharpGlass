@@ -1,40 +1,42 @@
 // LoadingOverlay.swift
 import SwiftUI
 
-/// A full‑screen overlay that shows a spinner and optional message while the app is busy.
+/// A simple spinning loader overlay during processing.
 struct LoadingOverlay: View {
     var message: String = "Processing..."
+    
     var body: some View {
         ZStack {
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .background(Color.black.opacity(0.2))
+            // Subtle darkening
+            Color.black.opacity(0.3)
                 .ignoresSafeArea()
             
-            VStack(spacing: 24) {
+            // Spinning loader
+            VStack(spacing: 16) {
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                    .scaleEffect(1.3)
+                    .scaleEffect(1.5)
                 
-                Text(message.uppercased())
-                    .font(.system(size: 11, weight: .black, design: .rounded))
-                    .kerning(4)
-                    .foregroundColor(.white.opacity(0.4))
+                Text(message)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.8))
             }
         }
     }
 }
 
-// Convenience view modifier to overlay LoadingOverlay when a binding is true.
+// Convenience view modifier
 struct LoadingOverlayModifier: ViewModifier {
     @Binding var isPresented: Bool
     var message: String = "Processing..."
+    
     func body(content: Content) -> some View {
         content
             .overlay(
                 Group {
                     if isPresented {
                         LoadingOverlay(message: message)
+                            .transition(.opacity.animation(.easeInOut(duration: 0.3)))
                     }
                 }
             )
@@ -46,5 +48,3 @@ extension View {
         self.modifier(LoadingOverlayModifier(isPresented: isPresented, message: message))
     }
 }
-
-// End of LoadingOverlay.swift

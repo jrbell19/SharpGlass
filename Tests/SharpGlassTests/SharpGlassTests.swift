@@ -1,6 +1,8 @@
-import XCTest
+import Testing
 @testable import SharpGlass
 
-final class SharpGlassTests: XCTestCase {
-    func testExample() throws {}
+@Suite("SharpGlass Tests")
+struct SharpGlassTests {
+    @Test("Example test")
+    func example() throws {}
 }
