@@ -23,25 +23,25 @@ SharpGlass uses a **Smart Onboarding** approach to minimize the initial download
 Ensure `ml-sharp` source is updated in `Sources/Main/Resources/ml-sharp`.
 (This is handled automatically by the project structure, but ensure no junk files like `.git` or `venv` are present in the source folder before release builds to save space).
 
-### 2. Build Release Configuration
-Run the following command to build the optimized release binary:
+### Automated Build (Recommended)
+Run the included build script to compile the release binary, generate assets, and create the `.app` bundle structure automatically:
 ```bash
-swift build -c release
+./build_distribution.sh
+```
+The output will be located at `dist/SharpGlass.app`.
+
+### Signing with Developer ID
+To sign with your Apple Developer ID (required for Notarization):
+```bash
+export SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+./build_distribution.sh
 ```
 
-### 3. Create App Bundle
-Use a script or manual steps to create the structure:
-```
-SharpGlass.app/
-  Contents/
-    Info.plist
-    MacOS/
-      SharpGlass (binary)
-    Resources/
-      Assets.car
-      AppIcon.icns
-      ml-sharp/ (Source code)
-```
+### Manual Build Steps
+If you prefer to build manually:
+1. **Compile Assets**: Use `actool` to compile `Assets.xcassets`.
+2. **Build Binary**: `swift build -c release`
+3. **Assemble Bundle**: Create the `SharpGlass.app` directory structure and copy the binary, `Info.plist`, `Assets.car`, and `ml-sharp` source code into `Contents/Resources`.
 
 **Note**: The SwiftPM build automatically bundles `ml-sharp` and `Assets.xcassets` into the bundle structure if run via Xcode or properly configured bundle tool.
 
