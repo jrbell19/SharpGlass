@@ -12,19 +12,32 @@ let package = Package(
     dependencies: [],
     targets: [
         .target(
-            name: "SharpGlass",
+            name: "SharpGlassLibrary",
             dependencies: [],
             path: "Sources/SharpGlass",
             exclude: ["Shaders.metal"]
         ),
         .executableTarget(
             name: "SharpGlassApp",
-            dependencies: ["SharpGlass"],
-            path: "Sources/Main"
+            dependencies: ["SharpGlassLibrary"],
+            path: "Sources/Main",
+            exclude: ["Info.plist"],
+            resources: [
+                .process("Assets.xcassets"),
+                .copy("Resources/ml-sharp")
+            ],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/Main/Info.plist"
+                ])
+            ]
         ),
         .testTarget(
             name: "SharpGlassTests",
-            dependencies: ["SharpGlass"],
+            dependencies: ["SharpGlassLibrary"],
             path: "Tests/SharpGlassTests"
         )
     ]

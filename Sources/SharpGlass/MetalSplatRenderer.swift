@@ -26,6 +26,17 @@ struct MetalUniforms {
 
 // MARK: - Renderer
 
+/// A high-performance Metal renderer for 3D Gaussian Splats.
+///
+/// **Pipeline Overview:**
+/// 1. **Sort**: GPU-based Radix Sort orders splats back-to-front based on view depth.
+/// 2. **Vertex**: Projects 3D Gaussians to 2D screen space (NDC) and computes covariance.
+/// 3. **Fragment**: Renders the Gaussian splat equations, handling alpha blending and spherical harmonics.
+///
+/// **Coordinate System:**
+/// - World: Right-handed, Y-Up (standard 3D).
+/// - ml-sharp Data: Often Y-Down, so we adjust the Up vector in `makeViewMatrix`.
+/// - NDC (Metal): X[-1, 1], Y[-1, 1] (Bottom-Up), Z[0, 1].
 @MainActor
 class MetalSplatRenderer: NSObject, MTKViewDelegate {
     private let device: MTLDevice
@@ -785,7 +796,7 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
         dispatchGPUPointsSort(commandBuffer: commandBuffer, viewMatrix: viewMatrix)
         
         // 2. Render
-        let projMatrix = makePerspectiveMatrix(fovRadians: degreesToRadians(60), aspect: aspectRatio, near: 0.1, far: 1000)
+        let projMatrix = MathUtils.makePerspectiveMatrix(fovRadians: MathUtils.degreesToRadians(60), aspect: aspectRatio, near: 0.1, far: 1000)
         var uniforms = MetalUniforms(
             viewMatrix: viewMatrix,
             projectionMatrix: projMatrix,
@@ -902,6 +913,8 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
     
     // MARK: - Camera Math
     
+    // MARK: - Camera Math
+    
     private func makeViewMatrix() -> matrix_float4x4 {
         // Standard LookAt Matrix
         let eye = vector_float3(Float(cameraPosition.x), Float(cameraPosition.y), Float(cameraPosition.z))
@@ -911,65 +924,12 @@ class MetalSplatRenderer: NSObject, MTKViewDelegate {
             target = vector_float3(Float(t.x), Float(t.y), Float(t.z))
         } else {
             // Fallback for legacy calls (should generally not be hit if VM is correct)
-            // Use rotation fields as Euler angles (Orbit default center at zero?)
-            // Just look forward -Z from Eye
             target = eye + vector_float3(0, 0, -1)
         }
         
         let up = vector_float3(0, -1, 0) // ml-sharp uses Y-down, so up is -Y
         
-        return matrix_look_at_right_hand(eye: eye, target: target, up: up)
+        return MathUtils.matrix_look_at_right_hand(eye: eye, target: target, up: up)
     }
-    
-    private func makePerspectiveMatrix(fovRadians: Float, aspect: Float, near: Float, far: Float) -> matrix_float4x4 {
-        // OpenCV Projection:
-        // x_ndc = x_view / z_view
-        // y_ndc = y_view / z_view (OpenCV Y is Down, Screen Y is Down... wait)
-        
-        // Metal NDC:
-        // x: [-1, 1] Right
-        // y: [-1, 1] Up (Bottom is -1, Top is +1)
-        // z: [0, 1] Into screen
-        
-        // Input View Space (OpenCV):
-        // +X: Right
-        // +Y: Down
-        // +Z: Forward
-        
-        // Projection needs:
-        // x_clip = x_view (Right maps to Right)
-        // y_clip = -y_view (Down maps to Down, which is Negative in Metal NDC)
-        // z_clip = map z_view from [near, far] to [0, 1]
-        
-        let ys = 1 / tanf(fovRadians * 0.5)
-        let xs = ys / aspect
-        let zs = far / (near - far)
-        
-        // Standard right-hand perspective projection for Metal NDC
-        return matrix_float4x4(columns: (
-            vector_float4(xs, 0, 0, 0),
-            vector_float4(0, ys, 0, 0),
-            vector_float4(0, 0, zs, -1),
-            vector_float4(0, 0, zs * near, 0)
-        ))
-    }
-    
-    // Matrix Helpers
-    
-    private func matrix_look_at_right_hand(eye: vector_float3, target: vector_float3, up: vector_float3) -> matrix_float4x4 {
-        let z = normalize(eye - target) // Forward is -Z, so Eye - Target = Positive Z axis (Backwards)
-        let x = normalize(simd_cross(up, z)) // Right
-        let y = cross(z, x) // Up
-        
-        // Standard LookAt
-        return matrix_float4x4(columns: (
-            vector_float4(x.x, y.x, z.x, 0),
-            vector_float4(x.y, y.y, z.y, 0),
-            vector_float4(x.z, y.z, z.z, 0),
-            vector_float4(-dot(x, eye), -dot(y, eye), -dot(z, eye), 1)
-        ))
-    }
-    
-    private func degreesToRadians(_ degrees: Float) -> Float { degrees * .pi / 180 }
 }
 

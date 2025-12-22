@@ -1,6 +1,6 @@
 import Testing
 import AppKit
-@testable import SharpGlass
+@testable import SharpGlassLibrary
 
 @Suite("Sharp Service Tests")
 struct SharpServiceTests {
@@ -45,11 +45,11 @@ struct SharpServiceTests {
             // We expect this to run through the CIImage/Vision pipeline.
             // Even if it fails to find a foreground, it should not CRASH.
             let result = try await service.generateGaussians(from: image, originalURL: nil, cleanBackground: true)
-            // If it succeeds (e.g. falls back to original), that's fine too.
-            #expect(result != nil)
+            // If it succeeds, verify we got some points
+            #expect(result.pointCount >= 0)
         } catch {
-            // Error is also acceptable as long as it's a known error type
-            #expect(error is SharpServiceError || error is NSError)
+            // Error is also acceptable
+            #expect(error is SharpServiceError || (error as NSError).domain.count > 0)
         }
     }
 }

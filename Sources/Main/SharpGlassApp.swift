@@ -1,5 +1,5 @@
 import SwiftUI
-import SharpGlass
+import SharpGlassLibrary
 
 @main
 struct SharpGlassApp: App {

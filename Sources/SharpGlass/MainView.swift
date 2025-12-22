@@ -11,7 +11,25 @@ public struct MainView: View {
     @State private var baseZoom: Double = 0
     
     public var body: some View {
+
         ZStack {
+            // Handle Drops Anywhere
+            Color.clear
+                .contentShape(Rectangle())
+                .onDrop(of: ["public.file-url"], isTargeted: $isDragging) { providers in
+                    guard let item = providers.first else { return false }
+                    _ = item.loadObject(ofClass: URL.self) { url, error in
+                        if let url = url {
+                            DispatchQueue.main.async {
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    viewModel.importFile(url: url)
+                                }
+                            }
+                        }
+                    }
+                    return true
+                }
+
             // ---------------------------------------------------------
             // 1. CONTENT LAYER
             // ---------------------------------------------------------
@@ -103,68 +121,63 @@ public struct MainView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            // Handle Drops on the Content Layer
-            .onDrop(of: ["public.file-url"], isTargeted: $isDragging) { providers in
-                guard let item = providers.first else { return false }
-                _ = item.loadObject(ofClass: URL.self) { url, error in
-                    if let url = url {
-                        // Defer import to next run loop to ensure drop completes
-                        DispatchQueue.main.async {
-                            // Add a small delay to ensure drag session is fully released
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                viewModel.importFile(url: url)
-                            }
-                        }
-                    }
-                }
-                return true
-            }
-            .loadingOverlay(isPresented: $viewModel.isProcessing)
             .ignoresSafeArea()
             
             // ---------------------------------------------------------
-            // 2. CHROME LAYER (UI)
+            // 2. CHROME LAYER (UI) + ONBOARDING OVERLAY
             // ---------------------------------------------------------
-            VStack {
-                // Title Bar (Centered)
-                Text("SharpGlass")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.6))
-                    .padding(.top, 12)
-                
-                Spacer()
-                
-                // Bottom Area (Stats + Pill)
-                ZStack(alignment: .bottom) {
-                    // Stats (Bottom Left)
-                    if let g = viewModel.gaussians {
-                        HStack {
-                            Text("\(g.pointCount.formatted()) splats")
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                .foregroundStyle(.white.opacity(0.35))
-                            Spacer()
-                        }
-                        .padding(.leading, 16)
-                        .padding(.bottom, 16)
-                    }
+            ZStack {
+                VStack {
+                    // Title Bar (Centered)
+                    Text("SharpGlass")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .padding(.top, 12)
                     
-                    // Liquid Glass Floating Pill Menu (Bottom Center)
-                    LiquidGlassPillMenu(
-                        canOpen: true,
-                        canGenerate: viewModel.selectedImage != nil && viewModel.gaussians == nil && viewModel.isAvailable,
-                        canSave: viewModel.gaussians != nil,
-                        onOpen: viewModel.loadImage,
-                        onGenerate: viewModel.generate3D,
-                        onSave: {
-                            let panel = NSSavePanel()
-                            panel.allowedContentTypes = [.init(filenameExtension: "ply")!]
-                            panel.nameFieldStringValue = "scene.ply"
-                            if panel.runModal() == .OK, let url = panel.url {
-                                viewModel.saveSplat(to: url)
+                    Spacer()
+                    
+                    // Bottom Area (Stats + Pill)
+                    ZStack(alignment: .bottom) {
+                        // Stats (Bottom Left)
+                        if let g = viewModel.gaussians {
+                            HStack {
+                                Text("\(g.pointCount.formatted()) splats")
+                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                    .foregroundStyle(.white.opacity(0.35))
+                                Spacer()
                             }
+                            .padding(.leading, 16)
+                            .padding(.bottom, 16)
                         }
-                    )
-                    .padding(.bottom, 30)
+                        
+                        // Liquid Glass Floating Pill Menu (Bottom Center)
+                        LiquidGlassPillMenu(
+                            canOpen: true,
+                            canGenerate: viewModel.selectedImage != nil && viewModel.gaussians == nil && viewModel.isAvailable,
+                            canSave: viewModel.gaussians != nil,
+                            onOpen: viewModel.loadImage,
+                            onGenerate: viewModel.generate3D,
+                            onSave: {
+                                let panel = NSSavePanel()
+                                panel.allowedContentTypes = [.init(filenameExtension: "ply")!]
+                                panel.nameFieldStringValue = "scene.ply"
+                                if panel.runModal() == .OK, let url = panel.url {
+                                    viewModel.saveSplat(to: url)
+                                }
+                            }
+                        )
+                        .padding(.bottom, 30)
+                    }
+                }
+                
+                // Onboarding Overlay (Centered Custom Modal)
+                if !viewModel.isAvailable {
+                    Color.black.opacity(0.7) // Dimmed background
+                        .ignoresSafeArea()
+                    
+                    SetupInstructionsView(viewModel: viewModel)
+                        .frame(width: 320)
+                        .shadow(color: .black.opacity(0.5), radius: 20, x: 0, y: 10)
                 }
             }
             .ignoresSafeArea()
@@ -192,6 +205,7 @@ struct LiquidGlassPillMenu: View {
             }
             .buttonStyle(.plain)
             .disabled(!canOpen)
+            .help("Open Image")
             
             // Divider
             Rectangle()
@@ -207,6 +221,7 @@ struct LiquidGlassPillMenu: View {
             }
             .buttonStyle(.plain)
             .disabled(!canGenerate)
+            .help("Generate 3D Splats")
             
             // Divider
             Rectangle()
@@ -222,6 +237,7 @@ struct LiquidGlassPillMenu: View {
             }
             .buttonStyle(.plain)
             .disabled(!canSave)
+            .help("Save Scene")
         }
         // Liquid Glass: blur with black at 25% opacity (dark mode)
         .background(
@@ -253,268 +269,106 @@ struct LiquidGlassPillMenu: View {
 
 
 
-// MARK: - Sidebar View
-struct SidebarView: View {
+
+
+
+struct SetupInstructionsView: View {
     @ObservedObject var viewModel: SharpViewModel
     
     var body: some View {
-        ScrollView(showsIndicators: false) {
-            VStack(spacing: 20) {
-                if let error = viewModel.errorMessage {
-                    Text(error.prefix(300))
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.red.opacity(0.8))
-                        .padding(10)
-                        .background(Color.red.opacity(0.05))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-                
-                // Action Steps
-                VStack(spacing: 24) {
-                    WorkflowStep(number: 1, title: "Source") {
-                        Button(action: viewModel.loadImage) {
-                            Text(viewModel.selectedImage == nil ? "SELECT IMAGE" : "REPLACE")
-                                .font(.system(size: 9, weight: .bold))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 30)
-                        }
-                        .buttonStyle(CinematicButtonStyle())
-                    }
-                    
-                    WorkflowStep(number: 2, title: "Process") {
-                        Button(action: viewModel.generate3D) {
-                            Text(viewModel.gaussians == nil ? "START" : "SYNC")
-                                .font(.system(size: 9, weight: .bold))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 30)
-                        }
-                        .buttonStyle(CinematicButtonStyle(prominent: true))
-                        .disabled(!viewModel.isAvailable || viewModel.selectedImage == nil || viewModel.isProcessing)
-                    }
-                    
-                    if let _ = viewModel.gaussians {
-                        // Stats Overlay
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text("SCENE STATS")
-                                    .font(.system(size: 8, weight: .bold))
-                                    .foregroundColor(.white.opacity(0.4))
-                                Spacer()
-                            }
-                            
-                            HStack(spacing: 12) {
-                                VStack(alignment: .leading, spacing: 0) {
-                                    Text(viewModel.pointCountFormatted)
-                                        .font(.system(size: 13, weight: .medium, design: .monospaced))
-                                        .foregroundColor(.white)
-                                    Text("Splats")
-                                        .font(.system(size: 8))
-                                        .foregroundColor(.white.opacity(0.5))
-                                }
-                                
-                                Color.white.opacity(0.1)
-                                    .frame(width: 1, height: 20)
-                                
-                                VStack(alignment: .leading, spacing: 0) {
-                                    Text(viewModel.memoryUsageFormatted)
-                                        .font(.system(size: 13, weight: .medium, design: .monospaced))
-                                        .foregroundColor(.white)
-                                    Text("VRAM")
-                                        .font(.system(size: 8))
-                                        .foregroundColor(.white.opacity(0.5))
-                                }
-                            }
-                        }
-                        .padding(12)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.05)))
-                        .padding(.bottom, 12)
-                        
-                        WorkflowStep(number: 3, title: "Refine") {
-                            VStack(spacing: 20) {
-                                VStack(spacing: 12) {
-                                    // Splat scale control only
-                                    HStack {
-                                        Text("SPLAT SCALE")
-                                            .font(.system(size: 9, weight: .bold))
-                                            .foregroundStyle(.white.opacity(0.4))
-                                        Spacer()
-                                        Text(String(format: "%.1f", viewModel.splatScale))
-                                            .font(.system(size: 9, design: .monospaced))
-                                            .foregroundStyle(.white.opacity(0.6))
-                                    }
-                                    Slider(value: $viewModel.splatScale, in: 0.1...2.0)
-                                        .controlSize(.mini)
-                                    
-                                    // Save Splat Button
-                                    if viewModel.gaussians != nil {
-                                        Button(action: {
-                                            let panel = NSSavePanel()
-                                            panel.allowedContentTypes = [.init(filenameExtension: "ply")!]
-                                            panel.nameFieldStringValue = "scene.ply"
-                                            if panel.runModal() == .OK, let url = panel.url {
-                                                viewModel.saveSplat(to: url)
-                                            }
-                                        }) {
-                                            HStack {
-                                                Image(systemName: "square.and.arrow.down")
-                                                Text("SAVE SPLAT")
-                                            }
-                                            .font(.system(size: 9, weight: .bold))
-                                            .frame(maxWidth: .infinity)
-                                            .frame(height: 28)
-                                        }
-                                        .buttonStyle(CinematicButtonStyle())
-                                    }
-                                }
-                                
-                                InputHelperView(mode: .orbit)
-                            }
-                        }
-                    }
-                    
-                    if !viewModel.isAvailable {
-                        SetupInstructionsView()
-                    }
-                }
+        VStack(alignment: .leading, spacing: 10) {
+            header
+            
+            if viewModel.setupStatus == .installing {
+                installProgress
+            } else {
+                actionContent
             }
-            .padding(12)
+            
+            if viewModel.setupStatus != .installing {
+                manualLink
+            }
         }
-        .background(.ultraThinMaterial)
-        .background(Color.black.opacity(0.15))
-        .frame(width: 220)
+        .padding(12)
+        .background(Color.black.opacity(0.3))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
         .overlay(
-            Rectangle()
-                .fill(Color.white.opacity(0.04))
-                .frame(width: 0.5)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.white.opacity(0.1), lineWidth: 0.5)
         )
     }
-}
-
-
-struct WorkflowStep<Content: View>: View {
-    let number: Int
-    let title: String
-    let content: Content
     
-    init(number: Int, title: String, @ViewBuilder content: () -> Content) {
-        self.number = number
-        self.title = title
-        self.content = content()
-    }
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Text("\(number)")
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.3))
-                    .frame(width: 16, height: 16)
-                    .overlay(Circle().stroke(Color.white.opacity(0.1), lineWidth: 1))
-                
-                Text(title.uppercased())
-                    .font(.system(size: 10, weight: .bold))
-                    .kerning(1)
-                    .foregroundStyle(.white.opacity(0.6))
-                    .minimumScaleFactor(0.8)
-                    .lineLimit(1)
-            }
-            
-            content
-        }
-    }
-}
-
-struct CameraSliderSimplified: View {
-    @Binding var value: Double
-    let label: String
-    let range: ClosedRange<Double>
-    let onChanged: () -> Void
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack {
-                Text(label)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
-                    .minimumScaleFactor(0.5)
-                    .lineLimit(1)
-                Spacer()
-                Text(String(format: "%.1f", value))
-                    .font(.system(size: 9, design: .monospaced))
-            }
-            Slider(value: $value, in: range) { editing in
-                if !editing { onChanged() }
-            }
-            .controlSize(.mini)
-        }
-    }
-}
-
-struct SetupInstructionsView: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Image(systemName: "info.circle")
-                Text("Setup Required")
-            }
-            .font(.system(size: 10, weight: .bold))
-            .foregroundStyle(.white.opacity(0.5))
-            
-            Text("Apple's ml-sharp logic is missing. Install via github.com/apple/ml-sharp")
-                .font(.system(size: 9))
-                .foregroundStyle(.secondary)
-                .minimumScaleFactor(0.5)
-            
-            Link("Guide", destination: URL(string: "https://github.com/apple/ml-sharp")!)
-                .font(.system(size: 9, weight: .medium))
-                .tint(.white.opacity(0.8))
-        }
-        .padding(10)
-        .background(Color.white.opacity(0.02))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-
-struct InputHelperView: View {
-    let mode: SharpViewModel.CameraMode
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 4) {
-                Image(systemName: "keyboard")
-                Text("CONTROLS")
-            }
-            .font(.system(size: 8, weight: .bold))
-            .foregroundStyle(.white.opacity(0.4))
-            
-            Group {
-                if mode == .fly {
-                    controlRow(key: "WASD", action: "Move")
-                    controlRow(key: "Shift/Space", action: "Up/Down")
-                    controlRow(key: "Mouse", action: "Look")
-                } else {
-                    controlRow(key: "LMB", action: "Rotate")
-                    controlRow(key: "RMB", action: "Pan")
-                    controlRow(key: "Scroll", action: "Zoom")
-                }
-            }
-        }
-        .padding(8)
-        .background(Color.white.opacity(0.03))
-        .cornerRadius(4)
-    }
-    
-    func controlRow(key: String, action: String) -> some View {
-        HStack {
-            Text(key)
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(.white.opacity(0.8))
-            Spacer()
-            Text(action)
-                .font(.system(size: 9))
+    var header: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "cpu")
+                .foregroundStyle(.cyan.opacity(0.8))
+            Text("ML BACKEND REQUIRED")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.6))
         }
     }
+    
+    var installProgress: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ProgressView(value: viewModel.setupProgress, total: 1.0)
+                .progressViewStyle(.linear)
+                .tint(.cyan)
+            
+            HStack {
+                Text(viewModel.setupStep.uppercased())
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.5))
+                Spacer()
+                Text("\(Int(viewModel.setupProgress * 100))%")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.3))
+            }
+        }
+    }
+    
+    var actionContent: some View {
+        Group {
+            if viewModel.setupStatus == .failed {
+                Text("Error: \(viewModel.errorMessage ?? "Unknown error")")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.red.opacity(0.9))
+                    .lineLimit(3)
+                    .padding(8)
+                    .background(Color.red.opacity(0.1))
+                    .cornerRadius(6)
+            } else {
+                Text("SharpGlass requires a one-time setup to install the AI engine (approx. 2GB).")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            
+            Button(action: {
+                viewModel.installBackend()
+            }) {
+                HStack {
+                    if viewModel.setupStatus == .failed {
+                        Image(systemName: "arrow.clockwise")
+                        Text("RETRY INSTALLATION")
+                    } else {
+                        Image(systemName: "arrow.down.circle.fill")
+                        Text("INSTALL ENGINE")
+                    }
+                }
+                .font(.system(size: 9, weight: .bold))
+                .frame(maxWidth: .infinity)
+                .frame(height: 28)
+            }
+            .buttonStyle(CinematicButtonStyle(prominent: true))
+        }
+    }
+    
+    var manualLink: some View {
+        Link("Manual Installation Guide", destination: URL(string: "https://github.com/apple/ml-sharp")!)
+           .font(.system(size: 8))
+           .tint(.white.opacity(0.3))
+           .padding(.top, 4)
+    }
 }
+
+

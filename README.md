@@ -9,10 +9,12 @@ SharpGlass is a macOS application for generating and rendering 3D Gaussian Splat
 - **Real-time Rendering**: interactive 3D navigation using a high-performance Metal-based splatting renderer.
 - **Video Export**: Export cinematic parallax animations as MP4 videos.
 - **Optimized Resource Management**: Automatically prunes large datasets and manages memory efficiently for smooth performance.
+- **Modern UI**: Full-bleed design with glassmorphic overlays and intuitive drag-and-drop file support.
 
 ## Prerequisites
 
 - **macOS 15.0+**
+- **High Performance GPU** (M-Series Pro/Max/Ultra recommended for large datasets)
 - **Python 3.13+** (Required for `ml-sharp`)
 - **Xcode 16.0+** (For building from source)
 

@@ -14,12 +14,59 @@ public class SharpViewModel: ObservableObject {
     @Published var cleanBackground = false  // Disabled - Vision AI not reliable for all images
     @Published var colorMode: ColorMode = .standard
 
+    // localized strings
+    private enum Constants {
+        static let installStarting = "Starting..."
+        static let installComplete = "Installation Complete"
+        static let installFailed = "Failed"
+    }
+
     public enum ColorMode {
         case standard
         case filmic
     }
 
     @Published var errorMessage: String?
+    
+    // Setup State
+    public enum SetupStatus {
+        case notStarted
+        case installing
+        case complete
+        case failed
+    }
+    @Published var setupStatus: SetupStatus = .notStarted
+    @Published var setupProgress: Double = 0.0
+    @Published var setupStep: String = ""
+    
+    public func installBackend() {
+        guard setupStatus != .installing else { return }
+        
+        setupStatus = .installing
+        setupProgress = 0.0
+        setupStep = Constants.installStarting
+        errorMessage = nil
+        
+        Task {
+            do {
+                try await sharpService.setupBackend { [weak self] step, progress in
+                    Task { @MainActor in
+                        self?.setupStep = step
+                        self?.setupProgress = progress
+                    }
+                }
+                
+                self.setupStatus = .complete
+                self.setupStep = Constants.installComplete
+                self.checkAvailability()
+                
+            } catch {
+                self.setupStatus = .failed
+                self.errorMessage = error.localizedDescription
+                self.setupStep = Constants.installFailed
+            }
+        }
+    }
     
     // Renderer Reference (for Offline Export)
     weak var renderer: MetalSplatRenderer?
@@ -325,9 +372,10 @@ public class SharpViewModel: ObservableObject {
     
     // ... Legacy init and load methods keep as is ...
     
-    let sharpService = SharpService()
+    let sharpService: SharpServiceProtocol
     
-    public init() {
+    public init(service: SharpServiceProtocol = SharpService()) {
+        self.sharpService = service
         checkAvailability()
     }
     

@@ -22,10 +22,33 @@ import ImageIO
 
 @MainActor
 public protocol SharpServiceProtocol {
+    /// Checks if the backend executable exists and is executable.
     func isAvailable() async -> Bool
+    
+    /// Generates 3D Gaussian Splats from a single 2D image.
+    /// - Parameters:
+    ///   - image: The source NSImage.
+    ///   - originalURL: Optional URL for fallback if background removal fails.
+    ///   - cleanBackground: Whether to attempt background removal (defaults to false).
+    /// - Returns: Parsed `GaussianSplatData` ready for rendering.
     func generateGaussians(from image: NSImage, originalURL: URL?, cleanBackground: Bool) async throws -> GaussianSplatData
+    
+    /// Renders a novel view implementation of the scene.
+    /// - Parameters:
+    ///   - splats: The Gaussian data.
+    ///   - cameraPosition: The desired virtual camera pose.
+    /// - Returns: The rendered frame as an NSImage.
     func renderNovelView(_ splats: GaussianSplatData, cameraPosition: CameraPosition) async throws -> NSImage
+    
+    /// Generates a frame-by-frame parallax animation.
     func generateParallaxAnimation(from image: NSImage, duration: Double, style: ParallaxStyle) async throws -> [NSImage]
+    
+    /// Downloads and installs the ml-sharp backend environment.
+    /// - Parameter progress: Closure reporting (Stage Name, 0.0-1.0 progress).
+    func setupBackend(progress: @escaping (String, Double) -> Void) async throws
+    
+    /// Cleans up temporary files.
+    func cleanup()
 }
 
 // MARK: - Data Types
@@ -117,7 +140,14 @@ public struct GaussianSplatData: Identifiable, Sendable {
         self.pointCount = positions.count
     }
     
-    /// Create PLY file data from Gaussian splat attributes
+    /// Create PLY file data from Gaussian splat attributes.
+    /// - Parameters:
+    ///   - positions: XYZ positions
+    ///   - colors: RGB colors (will be converted to SH DC)
+    ///   - opacities: Log-space opacity (or alpha, depending on pipeline)
+    ///   - scales: Log-space scales
+    ///   - rotations: Quaternions (r, x, y, z)
+    /// - Returns: Binary PLY data
     public static func createPLYData(
         positions: [SIMD3<Float>],
         colors: [SIMD3<Float>],
@@ -128,42 +158,34 @@ public struct GaussianSplatData: Identifiable, Sendable {
     ) throws -> Data {
         let pointCount = positions.count
         
-        var plyString = """
-        ply
-        format binary_little_endian 1.0
-        element vertex \(pointCount)
-        property float x
-        property float y
-        property float z
-        property float nx
-        property float ny
-        property float nz
-        """
+        // Use an array of strings to build header safely, avoiding multiline string newline pitfalls
+        let headerLines = [
+            "ply",
+            "format binary_little_endian 1.0",
+            "element vertex \(pointCount)",
+            "property float x",
+            "property float y",
+            "property float z",
+            "property float nx",
+            "property float ny",
+            "property float nz",
+            "property float f_dc_0",
+            "property float f_dc_1",
+            "property float f_dc_2",
+            "property float opacity",
+            "property float scale_0",
+            "property float scale_1",
+            "property float scale_2",
+            "property float rot_0",
+            "property float rot_1",
+            "property float rot_2",
+            "property float rot_3",
+            "end_header"
+        ]
         
-        // Always write color as SH DC coefficients (f_dc_0, f_dc_1, f_dc_2)
-        // This is the standard 3DGS format
-        plyString += """
+        let headerString = headerLines.joined(separator: "\n") + "\n"
         
-        property float f_dc_0
-        property float f_dc_1
-        property float f_dc_2
-        property float opacity
-        property float scale_0
-        property float scale_1
-        property float scale_2
-        property float rot_0
-        property float rot_1
-        property float rot_2
-        property float rot_3
-        end_header
-        
-        """
-        // The binary data MUST start immediately after the newline following "end_header\n"
-        // Multiline strings add an extra newline at the end if not careful.
-        // We'll trim the string and add exactly one newline.
-        let trimmedHeader = plyString.trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
-        
-        guard var data = trimmedHeader.data(using: .utf8) else {
+        guard var data = headerString.data(using: .utf8) else {
             throw SharpServiceError.processingFailed("Failed to create PLY header")
         }
         
@@ -756,6 +778,7 @@ public enum SharpServiceError: Error, LocalizedError {
     case failedToLoadPLY
     case invalidPLYFormat
     case renderingFailed
+    case runtimeError(String)
     
     public var errorDescription: String? {
         switch self {
@@ -766,6 +789,7 @@ public enum SharpServiceError: Error, LocalizedError {
         case .failedToLoadPLY: return "Failed to load PLY file"
         case .invalidPLYFormat: return "Invalid PLY format"
         case .renderingFailed: return "Rendering failed"
+        case .runtimeError(let msg): return msg
         }
     }
 }
@@ -814,12 +838,104 @@ public class SharpService: SharpServiceProtocol {
     
     /// Check if ml-sharp is available
     public func isAvailable() async -> Bool {
+        // Fast check: if we know the path exists from previous runs
+        let setupPath = await getAppSupportPath()
+        let localPath = setupPath + "/venv/bin/sharp"
+        if FileManager.default.fileExists(atPath: localPath) {
+            print("Sharp: ✅ Found local backend at \(localPath)")
+            return true
+        }
+    
         do {
+            // Debug: Check where it's resolving to
+            let resolved = await findExecutable("sharp")
+            print("Sharp: 🔎 Checking availability... Resolved 'sharp' to: \(resolved)")
+            
             let result = try await runCommand("sharp", arguments: ["--help"])
-            return result.contains("sharp")
+            let valid = result.contains("sharp")
+            if valid {
+                print("Sharp: ✅ Backend confirmed available via: \(resolved)")
+            } else {
+                print("Sharp: ❌ 'sharp' command found but --help validation failed.")
+            }
+            return valid
         } catch {
+            print("Sharp: ❌ Backend not found. Error: \(error)")
             return false
         }
+    }
+    
+    private func getAppSupportPath() async -> String {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return "/tmp"
+        }
+        let path = appSupport.appendingPathComponent("com.trond.SharpGlass").path
+        try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        return path
+    }
+    
+    /// Setup the backend by creating a venv and installing dependencies
+    public func setupBackend(progress: @escaping (String, Double) -> Void) async throws {
+        let appSupport = await getAppSupportPath()
+        
+        // 1. Check for Python 3.13
+        progress("Checking for Python 3.13...", 0.1)
+        do {
+            // Try to find python3.13 in path
+            let _ = try await runCommand("/usr/bin/env", arguments: ["python3.13", "--version"])
+        } catch {
+            throw SharpServiceError.runtimeError("Python 3.13 not found. Please install it with 'brew install python@3.13' or from python.org")
+        }
+        
+        // 2. Locate ml-sharp sources
+        // In a bundled app, this should be in Resources/ml-sharp.
+        // In dev, it might be a sibling directory.
+        progress("Locating ml-sharp sources...", 0.2)
+        
+        var sourcePath: String?
+        
+        // Check Bundle
+        if let bundlePath = Bundle.main.path(forResource: "ml-sharp", ofType: nil) {
+            sourcePath = bundlePath
+        } 
+        // Check Dev Sibling (Code/SharpGlass/ml-sharp)
+        else {
+            let devPath = FileManager.default.currentDirectoryPath + "/ml-sharp"
+            if FileManager.default.fileExists(atPath: devPath) {
+                sourcePath = devPath
+            }
+        }
+        
+        guard let mlSharpPath = sourcePath else {
+            throw SharpServiceError.runtimeError("Could not find ml-sharp sources. Please ensure 'ml-sharp' folder is inside the app bundle or project directory.")
+        }
+        
+        // 3. Create venv
+        progress("Creating virtual environment...", 0.3)
+        let venvPath = appSupport + "/venv"
+        if !FileManager.default.fileExists(atPath: venvPath) {
+            _ = try await runCommand("/usr/bin/env", arguments: ["python3.13", "-m", "venv", venvPath])
+        }
+        
+        // 4. Update pip
+        progress("Updating pip...", 0.4)
+        let pipPath = venvPath + "/bin/pip"
+        _ = try await runCommand(pipPath, arguments: ["install", "--upgrade", "pip"])
+        
+        // 5. Install Dependencies
+        progress("Installing dependencies (this may take a while)...", 0.5)
+        // We install from the ml-sharp source reference
+        // Note: We use -e . if in dev, but for user install just install regular
+        _ = try await runCommand(pipPath, arguments: ["install", mlSharpPath])
+        
+        // 6. Verify
+        progress("Verifying installation...", 0.9)
+        let sharpPath = venvPath + "/bin/sharp"
+        if !FileManager.default.fileExists(atPath: sharpPath) {
+             throw SharpServiceError.runtimeError("Installation completed but 'sharp' binary is missing.")
+        }
+        
+        progress("Ready!", 1.0)
     }
     
     /// Generate 3D Gaussian splats from a single image
@@ -1308,22 +1424,39 @@ public class SharpService: SharpServiceProtocol {
     }
     
     private func findExecutable(_ name: String) async -> String {
-        // 1. Check current directory (if running in dev)
+        // 0. Check if it's already an absolute path
+        if name.hasPrefix("/") && FileManager.default.isExecutableFile(atPath: name) {
+            return name
+        }
+
+        // 1. Check for executable in the app bundle (for distributed apps)
+        if let bundlePath = Bundle.main.path(forResource: name, ofType: nil, inDirectory: "Resources/bin") {
+             if FileManager.default.isExecutableFile(atPath: bundlePath) {
+                 return bundlePath
+             }
+        }
+
+        // 2. Check Application Support (for user-installed backend)
+        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let appSupportPath = appSupport.appendingPathComponent("com.trond.SharpGlass/venv/bin/\(name)").path
+            if FileManager.default.isExecutableFile(atPath: appSupportPath) {
+                return appSupportPath
+            }
+        }
+
+        // 3. Check current directory (if running in dev)
         let cwd = FileManager.default.currentDirectoryPath
-        let possiblePaths = [
-            "\(cwd)/ml-sharp/venv/bin/\(name)",
-            "\(cwd)/venv/bin/\(name)",
-            "/usr/local/bin/\(name)",
-            "/opt/homebrew/bin/\(name)"
-        ]
+        // 3. Logic removed.
         
+        /* TEMPORARILY DISABLED FOR ONBOARDING VERIFICATION
         for path in possiblePaths {
             if FileManager.default.fileExists(atPath: path) {
                 return path
             }
         }
+        */
         
-        // 2. Fallback to /usr/bin/env to find it in system PATH
+        // 4. Fallback to /usr/bin/env to find it in system PATH
         return "/usr/bin/env"
     }
     

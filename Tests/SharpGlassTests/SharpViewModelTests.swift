@@ -1,6 +1,6 @@
 import Testing
 import SwiftUI
-@testable import SharpGlass
+@testable import SharpGlassLibrary
 
 @Suite("Sharp ViewModel Tests")
 struct SharpViewModelTests {
@@ -10,7 +10,7 @@ struct SharpViewModelTests {
     func initialState() {
         let vm = SharpViewModel()
         #expect(vm.exposure == 0.0)
-        #expect(vm.gamma == 1.0)
+        #expect(vm.gamma == 2.2)
         #expect(vm.saturation == 1.0)
         #expect(vm.cameraMode == .orbit)
         #expect(!vm.isProcessing)
@@ -130,5 +130,121 @@ struct SharpViewModelTests {
         let cam = CameraPosition(x: 1, y: 2, z: 3)
         let matrixWithDefaultTarget = cam.viewMatrix()
         #expect(abs(matrixWithDefaultTarget.columns.2.z - 1.0) < 0.0001)
+    }
+    @Test("ViewModel Reset Logic")
+    @MainActor
+    func testResetLogic() {
+        let viewModel = SharpViewModel()
+        
+        // Change some values
+        viewModel.exposure = 2.0
+        viewModel.gamma = 1.0
+        viewModel.saturation = 0.0
+        viewModel.vignetteStrength = 1.0
+        viewModel.colorMode = .filmic
+        
+        // Reset
+        viewModel.resetToMatchSource()
+        
+        // Verify defaults
+        #expect(viewModel.exposure == 0.0)
+        #expect(viewModel.gamma == 2.2)
+        #expect(viewModel.saturation == 1.0)
+        #expect(viewModel.vignetteStrength == 0.0)
+        #expect(viewModel.colorMode == .standard)
+    }
+
+    // MARK: - Smart Onboarding Tests
+    
+    @Test("Install backend success flow")
+    @MainActor
+    func installBackendSuccess() async throws {
+        let mock = MockSharpService()
+        mock.mockIsAvailable = false
+        
+        // Pass mock to ViewModel
+        let vm = SharpViewModel(service: mock)
+        
+        // Initial State
+        #expect(vm.setupStatus == .notStarted)
+        
+        // Start Install
+        vm.installBackend()
+        
+        // Wait for async task to pick up (installBackend is fire-and-forget Task)
+        try await Task.sleep(nanoseconds: 100_000_000) 
+        
+        // Should be installing (or completed if fast)
+        // With small sleep in mock, it might still be running or done.
+        // Let's verify it moved away from notStarted
+        #expect(vm.setupStatus != .notStarted)
+        
+        // Wait for completion
+        try await Task.sleep(nanoseconds: 200_000_000)
+        
+        #expect(vm.setupStatus == .complete)
+        #expect(vm.setupStep == "Installation Complete")
+        #expect(vm.isAvailable)
+    }
+    
+    @Test("Install backend failure flow")
+    @MainActor
+    func installBackendFailure() async throws {
+        let mock = MockSharpService()
+        mock.mockIsAvailable = false
+        mock.shouldFailSetup = true
+        
+        let vm = SharpViewModel(service: mock)
+        
+        vm.installBackend()
+        
+        // Wait longer for failure flow (Task dispatch overhead)
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        
+        #expect(vm.setupStatus == .failed)
+        #expect(vm.errorMessage == "Simulated Setup Failure")
+    }
+}
+
+// MARK: - Mocks
+
+@MainActor
+class MockSharpService: SharpServiceProtocol {
+    var mockIsAvailable = false
+    var shouldFailSetup = false
+    
+    func isAvailable() async -> Bool {
+        return mockIsAvailable
+    }
+    
+    func generateGaussians(from image: NSImage, originalURL: URL?, cleanBackground: Bool) async throws -> GaussianSplatData {
+        throw SharpServiceError.processingFailed("Mock not implemented")
+    }
+    
+    func renderNovelView(_ splats: GaussianSplatData, cameraPosition: CameraPosition) async throws -> NSImage {
+        return NSImage()
+    }
+    
+    func generateParallaxAnimation(from image: NSImage, duration: Double, style: ParallaxStyle) async throws -> [NSImage] {
+        return []
+    }
+    
+    func setupBackend(progress: @escaping (String, Double) -> Void) async throws {
+        if shouldFailSetup {
+            throw SharpServiceError.runtimeError("Simulated Setup Failure")
+        }
+        
+        // Simulate progress
+        progress("Step 1", 0.5)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        progress("Step 2", 1.0)
+        // Yield to allow progress update to process on MainActor before returning
+        try await Task.sleep(nanoseconds: 10_000_000)
+        
+        mockIsAvailable = true
+    }
+    
+    func cleanup() {
+        // Mock cleanup
     }
 }

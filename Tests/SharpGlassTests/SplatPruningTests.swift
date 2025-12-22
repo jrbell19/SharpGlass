@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import SharpGlass
+@testable import SharpGlassLibrary
 
 @Suite("Splat Pruning Tests")
 struct SplatPruningTests {
@@ -33,7 +33,7 @@ struct SplatPruningTests {
         ]
         
         let rotations = Array(repeating: SIMD4<Float>(1, 0, 0, 0), count: 4)
-        let shs: [Float] = []
+        let _ : [Float] = []
         
         // Create splat data using private initializer via reflection
         // Since we can't access private init directly, we'll create via PLY

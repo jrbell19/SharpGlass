@@ -1,6 +1,6 @@
 import Testing
 import SwiftUI
-@testable import SharpGlass
+@testable import SharpGlassLibrary
 
 /// Tests for error handling and robustness improvements
 @Suite("Error Handling and Robustness")

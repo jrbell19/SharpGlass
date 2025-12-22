@@ -1,5 +1,5 @@
 import Testing
-@testable import SharpGlass
+@testable import SharpGlassLibrary
 
 @Suite("SharpGlass Tests")
 struct SharpGlassTests {

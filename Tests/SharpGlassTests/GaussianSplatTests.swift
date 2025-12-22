@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import SharpGlass
+@testable import SharpGlassLibrary
 
 @Suite("Gaussian Splat Tests")
 struct GaussianSplatTests {
@@ -34,7 +34,7 @@ struct GaussianSplatTests {
         // Add 2 vertices (14 floats each = 56 bytes per vertex)
         for _ in 0..<2 {
             for v in 0..<14 {
-                var val = Float(v)
+                let val = Float(v)
                 let bytes = withUnsafeBytes(of: val) { Data($0) }
                 data.append(bytes)
             }
@@ -191,11 +191,46 @@ struct GaussianSplatTests {
         // Prune to 5 points
         let pruned = splats.pruned(maxCount: 5)
         #expect(pruned.pointCount == 5)
-        #expect(!pruned.plyData.isEmpty)
+        #expect(!(pruned.plyData?.isEmpty ?? true))
         
         // Verify we can re-parse the pruned data
-        let reParsed = try GaussianSplatData(data: pruned.plyData)
+        let reParsed = try GaussianSplatData(data: pruned.plyData ?? Data())
         #expect(reParsed.pointCount == 5)
         #expect(reParsed.positions.count == 5)
+    }
+    @Test("Black Splat Prevention")
+    func testBlackSplatPrevention() throws {
+        // Regression: Merged splats were appearing black because SH coefficients were zeroed or parsed incorrectly.
+        // We ensure that valid RGB inputs produce valid SH DC components.
+        
+        let positions: [SIMD3<Float>] = [.zero]
+        let redColor = SIMD3<Float>(1.0, 0.0, 0.0) // Pure Red
+        let colors: [SIMD3<Float>] = [redColor]
+        let opacities: [Float] = [1.0]
+        let scales: [SIMD3<Float>] = [.one]
+        let rotations: [SIMD4<Float>] = [.init(0,0,0,1)]
+        
+        // 1. Create PLY
+        let data = try GaussianSplatData.createPLYData(
+            positions: positions,
+            colors: colors,
+            opacities: opacities,
+            scales: scales,
+            rotations: rotations
+        )
+        
+        // 2. Parse back using public initializer
+        let result = try GaussianSplatData(data: data)
+        
+        #expect(result.colors.count == 1)
+        
+        // 3. Verify Color is NOT black
+        let parsedColor = result.colors[0]
+        
+        // SH conversion is approximate, but should be close to Red
+        // Allow for some floating point drift from f_dc conversion
+        #expect(parsedColor.x > 0.8, "Red component should be preserved")
+        #expect(parsedColor.y < 0.2, "Green component should remain low")
+        #expect(parsedColor.z < 0.2, "Blue component should remain low")
     }
 }
