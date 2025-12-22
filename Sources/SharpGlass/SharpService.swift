@@ -1409,15 +1409,10 @@ public class SharpService: SharpServiceProtocol {
 
         // 3. Check current directory (if running in dev)
         let cwd = FileManager.default.currentDirectoryPath
-        // 3. Logic removed.
-        
-        /* TEMPORARILY DISABLED FOR ONBOARDING VERIFICATION
-        for path in possiblePaths {
-            if FileManager.default.fileExists(atPath: path) {
-                return path
-            }
+        let localVenvPath = cwd + "/venv/bin/\(name)"
+        if FileManager.default.isExecutableFile(atPath: localVenvPath) {
+             return localVenvPath
         }
-        */
         
         // 4. Fallback to /usr/bin/env to find it in system PATH
         return "/usr/bin/env"
