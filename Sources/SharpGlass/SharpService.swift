@@ -40,8 +40,6 @@ public protocol SharpServiceProtocol {
     /// - Returns: The rendered frame as an NSImage.
     func renderNovelView(_ splats: GaussianSplatData, cameraPosition: CameraPosition) async throws -> NSImage
     
-    /// Generates a frame-by-frame parallax animation.
-    func generateParallaxAnimation(from image: NSImage, duration: Double, style: ParallaxStyle) async throws -> [NSImage]
     
     /// Downloads and installs the ml-sharp backend environment.
     /// - Parameter progress: Closure reporting (Stage Name, 0.0-1.0 progress).
@@ -96,25 +94,6 @@ public struct CameraPosition: Sendable {
     }
 }
 
-public enum ParallaxStyle: String, CaseIterable, Identifiable {
-    case orbit = "Orbit"
-    case dolly = "Dolly Zoom"
-    case horizontal = "Pan Left-Right"
-    case vertical = "Tilt Up-Down"
-    case kenBurns = "Ken Burns"
-    
-    public var id: String { rawValue }
-    
-    var icon: String {
-        switch self {
-        case .orbit: return "arrow.triangle.2.circlepath"
-        case .dolly: return "arrow.up.and.down.and.arrow.left.and.right"
-        case .horizontal: return "arrow.left.arrow.right"
-        case .vertical: return "arrow.up.arrow.down"
-        case .kenBurns: return "camera.viewfinder"
-        }
-    }
-}
 
 /// Represents 3D Gaussian Splat data
 public struct GaussianSplatData: Identifiable, Sendable {
@@ -1114,23 +1093,7 @@ public class SharpService: SharpServiceProtocol {
         return try renderPointCloud(splats, camera: cameraPosition, device: device)
     }
     
-    /// Generate parallax animation frames
-    public func generateParallaxAnimation(from image: NSImage, duration: Double, style: ParallaxStyle) async throws -> [NSImage] {
-        // Generate Gaussians if not cached
-        let splats = try await generateGaussians(from: image)
-        
-        let frameCount = Int(duration * 30)  // 30 fps
-        var frames: [NSImage] = []
-        
-        for i in 0..<frameCount {
-            let t = Double(i) / Double(frameCount - 1)
-            let camera = cameraPositionForStyle(style, at: t)
-            let frame = try await renderNovelView(splats, cameraPosition: camera)
-            frames.append(frame)
-        }
-        
-        return frames
-    }
+
     
     
     private func saveFallbackImage(image: NSImage, originalURL: URL?, to path: URL) throws {
@@ -1460,41 +1423,6 @@ public class SharpService: SharpServiceProtocol {
         return "/usr/bin/env"
     }
     
-    private func cameraPositionForStyle(_ style: ParallaxStyle, at t: Double) -> CameraPosition {
-        // t goes from 0 to 1
-        let angle = t * 2 * .pi
-        
-        switch style {
-        case .orbit:
-            // Circular orbit around center
-            return CameraPosition(
-                x: 0.2 * cos(angle),
-                y: 0,
-                z: 0.2 * sin(angle),
-                rotationY: angle
-            )
-        case .dolly:
-            // Move forward and back
-            let z = 0.3 * sin(angle)
-            return CameraPosition(x: 0, y: 0, z: z)
-            
-        case .horizontal:
-            // Pan left to right
-            let x = 0.3 * sin(angle)
-            return CameraPosition(x: x, y: 0, z: 0)
-            
-        case .vertical:
-            // Tilt up and down
-            let y = 0.2 * sin(angle)
-            return CameraPosition(x: 0, y: y, z: 0, rotationX: y * 0.5)
-            
-        case .kenBurns:
-            // Slow zoom with slight pan
-            let z = -t * 0.2  // Zoom in
-            let x = t * 0.1 - 0.05
-            return CameraPosition(x: x, y: 0, z: z)
-        }
-    }
     
     private func renderPointCloud(_ splats: GaussianSplatData, camera: CameraPosition, device: MTLDevice) throws -> NSImage {
         // Simplified point cloud renderer (placeholder for full Gaussian splatting)

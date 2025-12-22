@@ -1,13 +1,12 @@
 # SharpGlass
 
-SharpGlass is a macOS application for generating and rendering 3D Gaussian Splats from single images using Apple's `ml-sharp`. It allows you to create high-quality 3D views from everyday photos, with built-in support for iPhone spatial photos and parallax animation export.
+SharpGlass is a macOS application for generating and rendering 3D Gaussian Splats from single images using Apple's `ml-sharp`. It allows you to create high-quality 3D views from everyday photos, with built-in support for iPhone spatial photos.
 
 ## Features
 
 - **3D Generation**: Convert single JPEG/PNG images into 3D Gaussian Splats.
 - **Spatial Photo Support**: Extract depth and stereo pairs from HEIC spatial photos for enhanced reconstruction.
 - **Real-time Rendering**: interactive 3D navigation using a high-performance Metal-based splatting renderer.
-- **Video Export**: Export cinematic parallax animations as MP4 videos.
 - **Optimized Resource Management**: Automatically prunes large datasets and manages memory efficiently for smooth performance.
 - **Smart Onboarding**: Automatically handles backend setup (Python venv, dependencies) for end-users on first launch.
 - **Modern UI**: Full-bleed design with glassmorphic overlays and intuitive drag-and-drop file support.
