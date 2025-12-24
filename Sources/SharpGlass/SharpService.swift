@@ -856,13 +856,11 @@ public class SharpService: SharpServiceProtocol {
     /// Setup the backend by creating a venv and installing dependencies
     public func setupBackend(progress: @escaping (String, Double) -> Void) async throws {
         let appSupport = await getAppSupportPath()
-        
+
         // 1. Check for Python 3.13
         progress("Checking for Python 3.13...", 0.1)
-        do {
-            // Try to find python3.13 in path
-            let _ = try await runCommand("/usr/bin/env", arguments: ["python3.13", "--version"])
-        } catch {
+        let python313Path = findPython313()
+        guard let pythonPath = python313Path else {
             throw SharpServiceError.runtimeError("Python 3.13 not found. Please install it with 'brew install python@3.13' or from python.org")
         }
         
@@ -870,30 +868,49 @@ public class SharpService: SharpServiceProtocol {
         // In a bundled app, this should be in Resources/ml-sharp.
         // In dev, it might be a sibling directory.
         progress("Locating ml-sharp sources...", 0.2)
-        
+
         var sourcePath: String?
-        
-        // Check Bundle
+
+        // Check Bundle (for distributed apps)
         if let bundlePath = Bundle.main.path(forResource: "ml-sharp", ofType: nil) {
             sourcePath = bundlePath
-        } 
-        // Check Dev Sibling (Code/SharpGlass/ml-sharp)
-        else {
-            let devPath = FileManager.default.currentDirectoryPath + "/ml-sharp"
-            if FileManager.default.fileExists(atPath: devPath) {
-                sourcePath = devPath
+        }
+        // Check current directory (works in terminal)
+        else if FileManager.default.fileExists(atPath: FileManager.default.currentDirectoryPath + "/ml-sharp") {
+            sourcePath = FileManager.default.currentDirectoryPath + "/ml-sharp"
+        }
+        // Check relative to executable (works in Xcode)
+        else if let executableURL = Bundle.main.executableURL {
+            // Navigate up from DerivedData/.../Debug/SharpGlass to project root
+            // Typical Xcode path: ~/Library/Developer/Xcode/DerivedData/.../Build/Products/Debug/SharpGlass
+            var searchURL = executableURL.deletingLastPathComponent() // Remove "SharpGlass"
+
+            // Try a few levels up to find ml-sharp
+            for _ in 0..<10 {
+                let candidatePath = searchURL.appendingPathComponent("ml-sharp").path
+                if FileManager.default.fileExists(atPath: candidatePath) {
+                    sourcePath = candidatePath
+                    break
+                }
+                searchURL = searchURL.deletingLastPathComponent()
             }
         }
-        
-        guard let mlSharpPath = sourcePath else {
-            throw SharpServiceError.runtimeError("Could not find ml-sharp sources. Please ensure 'ml-sharp' folder is inside the app bundle or project directory.")
+        // Check common project location (absolute path for your setup)
+        if sourcePath == nil && FileManager.default.fileExists(atPath: "/Users/jackbell/Desktop/SharpGlass/ml-sharp") {
+            sourcePath = "/Users/jackbell/Desktop/SharpGlass/ml-sharp"
         }
+
+        guard let mlSharpPath = sourcePath else {
+            throw SharpServiceError.runtimeError("Could not find ml-sharp sources. Searched Bundle, current directory, and project paths. Please ensure 'ml-sharp' folder exists.")
+        }
+
+        print("Sharp: Found ml-sharp at: \(mlSharpPath)")
         
         // 3. Create venv
         progress("Creating virtual environment...", 0.3)
         let venvPath = appSupport + "/venv"
         if !FileManager.default.fileExists(atPath: venvPath) {
-            _ = try await runCommand("/usr/bin/env", arguments: ["python3.13", "-m", "venv", venvPath])
+            _ = try await runCommand(pythonPath, arguments: ["-m", "venv", venvPath])
         }
         
         // 4. Update pip
@@ -1346,7 +1363,51 @@ public class SharpService: SharpServiceProtocol {
     }
     
     // MARK: - Private Helpers
-    
+
+    /// Find Python 3.13 installation by checking common locations
+    /// Returns the full path to python3.13 executable, or nil if not found
+    private func findPython313() -> String? {
+        let commonPaths = [
+            "/usr/local/bin/python3.13",
+            "/opt/homebrew/bin/python3.13",
+            "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13",
+            "/opt/local/bin/python3.13", // MacPorts
+        ]
+
+        // Check common locations first
+        for path in commonPaths {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+
+        // Fall back to PATH search (works in terminal but may fail in Xcode)
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        process.arguments = ["python3.13"]
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            if process.terminationStatus == 0 {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !path.isEmpty,
+                   FileManager.default.isExecutableFile(atPath: path) {
+                    return path
+                }
+            }
+        } catch {
+            // which command failed, continue to return nil
+        }
+
+        return nil
+    }
+
     private func runCommand(_ command: String, arguments: [String]) async throws -> String {
         let executablePath = await findExecutable(command)
         
